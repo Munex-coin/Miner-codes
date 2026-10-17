@@ -1,8 +1,8 @@
 // ======= Config for user =======
-#define WIFI_SSID              "NOKIA-5D71"
-#define WIFI_PASSWORD          "zkDAej8QuW"
+#define WIFI_SSID              "YOUR WIFI SSID"
+#define WIFI_PASSWORD          "YOUR WIFI PASSWORD"
 
-#define MCX_NODE_HOST          "192.168.88.4"
+#define MCX_NODE_HOST          "munexseed.duckdns.org"
 #define MCX_NODE_PORT          8080
 #define MCX_PRIVKEY_HEX        ""
 #define MCX_WALLET_OVERRIDE    ""
