@@ -1,0 +1,11 @@
+download PC_Miner.go and go.mod under the same folder, then, run:
+====
+go mod tidy
+====
+and then to run the PC_Miner.go:
+====
+go run PC_Miner.go
+====
+
+NOTE: do remember to download golang onto ur device PATH first to continue with these steps
+
