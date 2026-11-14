@@ -1,0 +1,6 @@
+the settin gs file is miner_settings.json where all the wallet credentials are stored. this includes tye wallet address and other sensetive data. the private
+key would not be plainly stored in that file for security reasons and so it has to be encrypted. please use the show_key.py and run it, an example is shown bel.ow:
+
+"python show_key.py miner_settings.json"
+
+NOTE: be sure to save the show_key.py in the same folder as where the miner settings file is saved.
