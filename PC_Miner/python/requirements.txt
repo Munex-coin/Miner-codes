@@ -1,0 +1,25 @@
+# Munex Python miner + CLI wallet + API scripts — requirements (testnet)
+#
+# For: PC_Miner.py (Python miner), munex_wallet.py (CLI wallet), and the
+# api/ scripts (05_send_transfer.py etc.). Python 3.12.
+# Install in a venv:
+#   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+# Or, in the Munex venv: ~/workspace/munex/.venv/bin/pip install -r requirements.txt
+#
+# Versions are pinned to what is installed in the Munex venv
+# (~/workspace/munex/.venv, Python 3.12.3), which the launch files were
+# tested against. Do NOT add web3 — it is not installed and not needed.
+#
+# Direct dependencies (what the code imports):
+websockets==17.4        # miner WebSocket to the node (PC_Miner.py)
+cryptography==50.0.2    # miner signing (ECDSA) + secret encryption
+argon2-cffi==25.1.0     # miner secret encryption (argon2.low_level)
+eth-account==0.14.0     # wallet + 05_send_transfer.py: sign transactions
+eth-utils==6.0.0        # address checksums, keccak (miner fallback)
+pycryptodome==3.24.1    # keccak fallback for the miner (Crypto.Hash.keccak)
+#
+# Optional (the miner handles a missing import and carries on):
+# pqc-crypto -- post-quantum signatures (PQC_AVAILABLE=False without it).
+#   Not installed in the Munex venv and not needed for testnet mining.
+#   Uncomment to install it if you want PQC signatures:
+# pqc-crypto==0.1.0
