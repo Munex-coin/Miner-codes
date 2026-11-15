@@ -1,0 +1,12 @@
+file that wallet credentials are stored: wallet.json(NOTE: the python version stores the wallet credentials in miner_settings.json, please dont get mixed up)
+
+Private key is not directly stored in wallet.json. it is encrypted. Please use the show_key.py file to unencrypt the key.
+
+How to use show_key.py: python show_key.py wallet.json
+
+How to set up the miner:
+    run: go.mod tidy
+    then, run: go run PC_Miner.go
+
+  REMINDER: please save go.mod and go.sum in the same file as PC_Miner.go
+       
