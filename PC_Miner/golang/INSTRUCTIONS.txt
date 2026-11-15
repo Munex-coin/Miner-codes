@@ -5,7 +5,7 @@ Private key is not directly stored in wallet.json. it is encrypted. Please use t
 How to use show_key.py: python show_key.py wallet.json
 
 How to set up the miner:
-    run: go.mod tidy
+    run: go mod tidy
     then, run: go run PC_Miner.go
 
   REMINDER: please save go.mod and go.sum in the same file as PC_Miner.go
