@@ -1,19 +1,5 @@
 #!/usr/bin/env python3
-"""show_key.py — show the wallet private key locked in a Munex key file, once.
-
-Works with both files:
-  - node wallet.json        (fields: address / private_key_encrypted {salt, nonce, data, argon2_hash})
-  - miner miner_settings.json (fields: wallet / privkey {salt, nonce, ct})
-
-The password is asked with getpass: never shown on screen, never saved,
-never written to any file. The key is printed once so you can copy it
-(e.g. into the website wallet, or a password manager). Do NOT paste it
-into a chat, a log, or any file that gets synced or shared.
-
-Usage:
-  python show_key.py wallet.json
-  python show_key.py miner_settings.json
-
+"""
 Needs the same libraries the node/miner already need:
   pip install cryptography argon2-cffi
 """
