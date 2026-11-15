@@ -4,3 +4,11 @@ key would not be plainly stored in that file for security reasons and so it has 
 "python show_key.py miner_settings.json"
 
 NOTE: be sure to save the show_key.py in the same folder as where the miner settings file is saved.
+
+HOW TO SET UP THE MINER:
+   NOTE: save requirements.txt in the same folder as the pc miner file
+   to install all libs and modules, RUN: python -m pip install -r requirements.txt
+   to activate the miner, RUN: python PC_Miner.py
+   
+   input ur password when prompted to, please note down this password as it would be important soon if u ever want to unencrypt the data in miner_settings.json    to get the private key.
+  
