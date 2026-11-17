@@ -1,6 +1,6 @@
 # Notice
 
-Munex is experimental testnet software. It is provided as-is, with no
+Munex is testnet software. It is provided as-is, with no
 warranty of any kind.
 
 The creators and contributors are not liable for any financial loss,
