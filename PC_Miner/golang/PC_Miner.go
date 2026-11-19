@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"math/big"
+	"net/http"
 	"os"
 	"sort"
 	"strconv"
@@ -27,20 +28,20 @@ import (
 
 // ANSI colours (work on Windows 10+ terminals and most Unix terminals).
 const (
-	cReset  = "\033[0m"
-	cBold   = "\033[1m"
-	cDim    = "\033[2m"
-	cRed    = "\033[31m"
-	cGreen  = "\033[32m"
-	cYellow = "\033[33m"
-	cBlue   = "\033[34m"
-	cMagenta = "\033[35m"
-	cCyan   = "\033[36m"
-	cWhite  = "\033[37m"
-	cBgBlue = "\033[44m"
-	cBgGreen = "\033[42m"
-	cBgYellow = "\033[43m"
-	cBgRed  = "\033[41m"
+	cReset     = "\033[0m"
+	cBold      = "\033[1m"
+	cDim       = "\033[2m"
+	cRed       = "\033[31m"
+	cGreen     = "\033[32m"
+	cYellow    = "\033[33m"
+	cBlue      = "\033[34m"
+	cMagenta   = "\033[35m"
+	cCyan      = "\033[36m"
+	cWhite     = "\033[37m"
+	cBgBlue    = "\033[44m"
+	cBgGreen   = "\033[42m"
+	cBgYellow  = "\033[43m"
+	cBgRed     = "\033[41m"
 	cBgMagenta = "\033[45m"
 )
 
@@ -53,6 +54,9 @@ const (
 // (set to 6620 only when pointing at a mainnet node).
 var chainID = 6621
 
+const registryURLDefault = "https://munex-registry.animax-plorer22.workers.dev/nodes"
+const seedNodeURL = "ws://munexseed1.duckdns.org:8080/ws"
+
 var excludedFields = map[string]struct{}{
 	"hash":          {},
 	"signature":     {},
@@ -64,15 +68,16 @@ var directionNames = []string{"east", "west", "north", "south", "up", "down"}
 var directionOffsets = []point3{{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}}
 
 type config struct {
-	nodeURL    string
-	key        string
-	keyFile    string
-	walletFile string
-	suffix     string
-	navigate   bool
-	duration   time.Duration
-	generate   bool
-	saveWallet bool
+	nodeURL     string
+	registryURL string
+	key         string
+	keyFile     string
+	walletFile  string
+	suffix      string
+	navigate    bool
+	duration    time.Duration
+	generate    bool
+	saveWallet  bool
 }
 
 type minerKey struct {
@@ -97,26 +102,26 @@ type mazeState struct {
 	navigate bool
 
 	// live stats (for coloured move / status logs)
-	steps         int
-	accepted      int
-	attempts      int
-	walls         int
-	goals         int
-	blocks        int
-	rejectsInRow  int
-	lastMoveAt    time.Time
-	lastSyncAt    time.Time
-	sessionAt     time.Time
-	lastDir       string
-	blockID       any
-	difficulty    float64
-	minerTag      string
+	steps        int
+	accepted     int
+	attempts     int
+	walls        int
+	goals        int
+	blocks       int
+	rejectsInRow int
+	lastMoveAt   time.Time
+	lastSyncAt   time.Time
+	sessionAt    time.Time
+	lastDir      string
+	blockID      any
+	difficulty   float64
+	minerTag     string
 }
 
 const (
-	movePaceMin     = 300 * time.Millisecond // node move processing is ~100-500ms; faster just earns "busy, retry"
-	rejectResyncAt  = 3                     // consecutive rejects → get_maze_state
-	rejectBackoff   = 200 * time.Millisecond
+	movePaceMin    = 300 * time.Millisecond // node move processing is ~100-500ms; faster just earns "busy, retry"
+	rejectResyncAt = 3                      // consecutive rejects → get_maze_state
+	rejectBackoff  = 200 * time.Millisecond
 )
 
 type wsClient struct {
@@ -183,7 +188,8 @@ func main() {
 
 	info("miner  %s", key.minerID)
 	info("wallet %s", key.wallet)
-	info("node   %s", cfg.nodeURL)
+	nodes := discoverNodes(cfg)
+	info("nodes  %s", strings.Join(nodes, ", "))
 	ok("mining started — navigating maze")
 
 	if cfg.duration > 0 {
@@ -193,10 +199,18 @@ func main() {
 		})
 	}
 
+	idx := 0
 	for {
-		if err := runSession(cfg.nodeURL, key, cfg.navigate); err != nil {
+		if err := runSession(nodes[idx], key, cfg.navigate); err != nil {
 			errf("session ended: %v", err)
 			warn("reconnecting in 3s…")
+		}
+		idx++
+		if idx >= len(nodes) {
+			idx = 0
+			if !flagWasPassed("url") && os.Getenv("MCX_NODE_WS") == "" && cfg.nodeURL == seedNodeURL {
+				nodes = discoverNodes(cfg)
+			}
 		}
 		time.Sleep(3 * time.Second)
 	}
@@ -205,6 +219,7 @@ func main() {
 func parseConfig() config {
 	var cfg config
 	flag.StringVar(&cfg.nodeURL, "url", envOr("MCX_NODE_WS", ""), "node websocket URL")
+	flag.StringVar(&cfg.registryURL, "registry-url", envOr("MCX_REGISTRY_URL", registryURLDefault), "registry URL (node list)")
 	flag.StringVar(&cfg.key, "key", os.Getenv("MCX_MINER_PRIVATE_KEY"), "32-byte hex private key")
 	flag.StringVar(&cfg.keyFile, "key-file", "", "file containing a 32-byte hex private key")
 	flag.StringVar(&cfg.walletFile, "wallet-file", "", "wallet JSON containing privkey")
@@ -708,6 +723,51 @@ func signBlock(block map[string]any, key *minerKey) (string, error) {
 	return hashHex, nil
 }
 
+func fetchRegistryNodes(url string) []string {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		warn("registry fetch failed: %v", err)
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		warn("registry HTTP %d", resp.StatusCode)
+		return nil
+	}
+	var body struct {
+		Nodes []struct {
+			IP     string `json:"ip"`
+			WsPort int    `json:"ws_port"`
+			WsURL  string `json:"ws_url"`
+		} `json:"nodes"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		warn("registry JSON error: %v", err)
+		return nil
+	}
+	var out []string
+	for _, n := range body.Nodes {
+		if n.WsURL != "" {
+			out = append(out, n.WsURL)
+		} else if n.IP != "" && n.WsPort != 0 {
+			out = append(out, "ws://"+n.IP+":"+strconv.Itoa(n.WsPort)+"/ws")
+		}
+	}
+	return out
+}
+
+func discoverNodes(cfg config) []string {
+	if flagWasPassed("url") || os.Getenv("MCX_NODE_WS") != "" || cfg.nodeURL != seedNodeURL {
+		return []string{cfg.nodeURL}
+	}
+	nodes := fetchRegistryNodes(cfg.registryURL)
+	if len(nodes) > 0 {
+		info("registry %d node(s)", len(nodes))
+	}
+	return append(nodes, seedNodeURL)
+}
+
 func dial(url string) (*wsClient, error) {
 	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
 	if err != nil {
@@ -811,14 +871,27 @@ func runSession(url string, key *minerKey, navigate bool) error {
 				state.size, posStr(state.current), posStr(state.goal), state.growth, state.blockID)
 		case "maze_state":
 			if state != nil {
+				// A sync that lands while a move is still in flight must
+				// not touch the nonce or clear busy: the server's movenonce
+				// is the pre-move value, so resetting to it and sending a
+				// new move re-sends the in-flight nonce, and the server
+				// rejects the duplicate ("Nonce mismatch: expected N+1,
+				// got N"). The map/position/goal updates still apply; the
+				// in-flight move's ack drives the next move.
+				inFlight := state.busy
+				savedNonce := state.nonce
 				rawState, _ := message["state"].(map[string]any)
 				state.applyState(rawState)
 				state.applyMazeFields(message)
 				if rawState != nil {
 					state.applyMazeFields(rawState)
 				}
-				state.rejectsInRow = 0
-				state.busy = false
+				if inFlight {
+					state.nonce = savedNonce
+				} else {
+					state.rejectsInRow = 0
+					state.busy = false
+				}
 				info("state synced  pos=%s  goal=%s  nonce=%d  %d³",
 					posStr(state.current), posStr(state.goal), state.nonce, state.size)
 			}
@@ -927,8 +1000,8 @@ func pingLoop(client *wsClient, done <-chan struct{}) {
 
 func newMazeState(message map[string]any) (*mazeState, error) {
 	state := &mazeState{
-		sealed:    make(map[point3]bool),
-		sessionAt: time.Now(),
+		sealed:     make(map[point3]bool),
+		sessionAt:  time.Now(),
 		lastMoveAt: time.Now(),
 	}
 	state.size = intValue(message["size"])

@@ -11,6 +11,13 @@
 #define MCX_NODE_HOST          "munexseed.duckdns.org"
 #define MCX_NODE_PORT          8080
 
+// Registry: the Munex registry lists live node IPs. The miner asks
+// it first and falls back to MCX_NODE_HOST when it is down or
+// unreachable. Set to 0 to skip the registry and always use
+// MCX_NODE_HOST.
+#define MCX_REGISTRY_ENABLED   1
+#define MCX_REGISTRY_URL       "https://munex-registry.animax-plorer22.workers.dev/nodes"
+
 // Wallet: the wallet address is DERIVED from the private key — you do NOT
 // type an address here. Two options:
 //   1) Leave "" : the miner generates a fresh key once and keeps it in NVS
@@ -120,6 +127,8 @@ class WebSocketsClient;
 #include <stdlib.h>
 #include <Preferences.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 // No third-party libraries: WebSockets, JSON and secp256k1 are implemented
 // in this file (see the shims below) on top of the ESP32 Arduino core and
 // ESP-IDF (WiFiClient, mbedTLS). Nothing to download.
@@ -2575,6 +2584,9 @@ static uint32_t gLastFrameMs = 0;
 static uint32_t gConnectedMs = 0;
 static uint32_t gRegisterSentMs = 0;
 static bool     gWsBegun = false;   // begin() called exactly once (see wsEnsureBegun)
+static char     gNodeHost[64] = ""; // active node host: registry pick, else MCX_NODE_HOST
+static uint16_t gNodePort = 0;      // active node port
+static bool     gRegistryTried = false;
 static uint8_t  gRegFailStreak = 0;
 static bool     gNtpOk = false;
 static bool     gNtpDead = false;   // NTP unreachable: proceed without time sync (see ntpWatchdog)
@@ -3336,21 +3348,86 @@ static void doReconnect(const char* why) {
   webSocket.disconnect();
 }
 
+// Registry reader: one HTTPS GET of the node list. The list is public
+// data and the miner's key never leaves the board on this link; the
+// node's own WebSocket link is plain ws:// today, so this fetch is
+// not the weak link. TLS runs without a bundled root (setInsecure):
+// the sketch ships no CA bundle to download, and a bad or hostile
+// list fails the JSON parse below and falls back to the configured
+// node. Bounded by the HTTPClient timeout (5 s).
+static bool fetchRegistryNode() {
+#if !MCX_REGISTRY_ENABLED
+  return false;
+#else
+  WiFiClientSecure tls;
+  tls.setInsecure();
+  HTTPClient http;
+  http.setTimeout(5000);
+  if (!http.begin(tls, MCX_REGISTRY_URL)) return false;
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) { http.end(); return false; }
+  String body = http.getString();
+  http.end();
+  if (body.length() == 0 || body.length() > 8192) return false;
+  JsonDocument doc;
+  if (deserializeJson(doc, body.c_str(), body.length())) return false;
+  JsonArrayConst nodes = doc["nodes"].as<JsonArrayConst>();
+  if (nodes.isNull() || nodes.size() == 0) return false;
+  JsonVariantConst first = nodes[0];
+  const char* wsUrl = first["ws_url"] | "";
+  if (*wsUrl) {
+    const char* h = strstr(wsUrl, "://");
+    if (!h) return false;
+    h += 3;
+    const char* slash = strchr(h, '/');
+    size_t hostLen = slash ? (size_t)(slash - h) : strlen(h);
+    const char* colon = (const char*)memchr(h, ':', hostLen);
+    uint16_t port = MCX_NODE_PORT;
+    if (colon) {
+      port = (uint16_t)atoi(colon + 1);
+      hostLen = (size_t)(colon - h);
+    }
+    if (hostLen == 0 || hostLen >= sizeof(gNodeHost) || port == 0) return false;
+    memcpy(gNodeHost, h, hostLen);
+    gNodeHost[hostLen] = '\0';
+    gNodePort = port;
+  } else {
+    const char* ip = first["ip"] | "";
+    int port = first["ws_port"] | 0;
+    if (!*ip || port <= 0 || port > 65535) return false;
+    strncpy(gNodeHost, ip, sizeof(gNodeHost) - 1);
+    gNodeHost[sizeof(gNodeHost) - 1] = '\0';
+    gNodePort = (uint16_t)port;
+  }
+  logf_("WS", "registry node %s:%d", gNodeHost, (int)gNodePort);
+  return true;
+#endif
+}
+
 // Called when WiFi is up. Runs begin() at most once for the whole uptime:
 // the NTP gate must NOT delay it (NTP only gates REGISTER, not TCP), so a
 // dead NTP path can never leave the client permanently uninitialized.
 static void wsEnsureBegun() {
   if (gWsBegun) return;
   if (WiFi.status() != WL_CONNECTED) return;
+  if (!gRegistryTried) {
+    gRegistryTried = true;
+    if (!fetchRegistryNode()) {
+      strncpy(gNodeHost, MCX_NODE_HOST, sizeof(gNodeHost) - 1);
+      gNodeHost[sizeof(gNodeHost) - 1] = '\0';
+      gNodePort = MCX_NODE_PORT;
+      logf_("WS", "registry unavailable, using configured node %s:%d", gNodeHost, (int)gNodePort);
+    }
+  }
   IPAddress ip;
-  if (WiFi.hostByName(MCX_NODE_HOST, ip)) {
-    logf_("WS", "begin %s:%d/ws (resolved %s)", MCX_NODE_HOST, (int)MCX_NODE_PORT,
+  if (WiFi.hostByName(gNodeHost, ip)) {
+    logf_("WS", "begin %s:%d/ws (resolved %s)", gNodeHost, (int)gNodePort,
           ip.toString().c_str());
   } else {
     logf_("WS", "begin %s:%d/ws (DNS pending here; library resolves per attempt)",
-          MCX_NODE_HOST, (int)MCX_NODE_PORT);
+          gNodeHost, (int)gNodePort);
   }
-  webSocket.begin(MCX_NODE_HOST, MCX_NODE_PORT, "/ws");
+  webSocket.begin(gNodeHost, gNodePort, "/ws");
   gWsBegun = true;
   if (gPhase != PH_CHALLENGE) gPhase = PH_REGISTER;
 }
@@ -4054,7 +4131,7 @@ static void onWsEvent(WStype_t type, uint8_t* payload, size_t len) {
       gConnectedMs = millis();
       gLastFrameMs = millis();
       gMazeAskDone = false;
-      logf_("WS", "connected to %s:%d", MCX_NODE_HOST, MCX_NODE_PORT);
+      logf_("WS", "connected to %s:%d", gNodeHost, (int)gNodePort);
       if (!gNtpOk && !gNtpDead) {
         logf_("WS", "NTP not synced yet - refusing register, retrying");
         doReconnect("ntp pending");
@@ -4215,7 +4292,7 @@ static void wsWatchdog(uint32_t now) {
     if ((now - lastDownLog) > 30000) {
       lastDownLog = now;
       logf_("WS", "link down, library retrying %s:%d/ws (wifi %s, ntp %s)...",
-            MCX_NODE_HOST, (int)MCX_NODE_PORT,
+            gNodeHost, (int)gNodePort,
             WiFi.localIP().toString().c_str(), gNtpOk ? "ok" : (gNtpDead ? "dead" : "wait"));
     }
   }

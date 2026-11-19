@@ -9,6 +9,7 @@ try:
 except Exception:
     pass
 import sys, os, re, time, json, base64, hashlib, secrets, random, asyncio, argparse, socket, heapq
+import urllib.request
 from datetime import datetime
 from collections import deque
 import websockets
@@ -264,6 +265,7 @@ DEFAULT_SETTINGS = {
     "pqc_priv": "",
     "model_format": "json",
     "node_url": "",
+    "registry_url": "https://munex-registry.animax-plorer22.workers.dev/nodes",
     "dns_seeds": ["munexseed1.duckdns.org"],
     "bootstrap_nodes": [
         "ws://munexseed1.duckdns.org:8080/ws",
@@ -285,6 +287,7 @@ DEFAULT_SETTINGS = {
 }
 
 DNS_SEEDS = ["munexseed1.duckdns.org"]
+REGISTRY_URL_DEFAULT = "https://munex-registry.animax-plorer22.workers.dev/nodes"
 FALLBACK_NODE = "ws://munexseed1.duckdns.org:8080/ws"
 WS_PATH = "/ws"
 WS_DEFAULT_PORT = 8080
@@ -586,12 +589,29 @@ def resolve_dns(domain, port=WS_DEFAULT_PORT):
         pass
     return urls
 
+def fetch_registry_nodes(url):
+    urls = []
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "munex-miner/1.0", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as res:
+            if res.status != 200:
+                return urls
+            data = json.loads(res.read().decode("utf-8", "replace"))
+        for n in (data.get("nodes") or []):
+            if isinstance(n, dict) and n.get("ws_url"):
+                urls.append(str(n["ws_url"]))
+    except Exception:
+        pass
+    return urls
+
+
 async def discover_nodes(settings: dict) -> list:
     """Return a list of candidate WS URLs to try, ordered:
        1. the user-pinned node_url (if any)
        2. hardcoded bootstrap_nodes from settings
-       3. cached peers from miner_peers.json (freshest first, dead ones skipped)
-       4. DNS seeds as a last resort
+       3. the Munex registry (nodes list; skipped if unreachable)
+       4. cached peers from miner_peers.json (freshest first, dead ones skipped)
+       5. DNS seeds as a last resort
     The pinned head stays at position 0; the rest are shuffled so repeated
     attempts don't hammer the same dead URL forever."""
     candidates, seen = [], set()
@@ -603,8 +623,11 @@ async def discover_nodes(settings: dict) -> list:
 
     for u in (settings.get("bootstrap_nodes") or []):
         add(u)
+
+    for u in fetch_registry_nodes(settings.get("registry_url", REGISTRY_URL_DEFAULT)):
+        add(u)
     if not candidates:
-        add(FALLBACK_NODE)
+        add(settings.get("fallback_node", FALLBACK_NODE))
 
     for url, meta in sorted(_load_miner_peers().items(),
                             key=lambda kv: kv[1].get("last_seen", 0), reverse=True):
@@ -4021,6 +4044,7 @@ class PCMiner:
 async def main():
     parser = argparse.ArgumentParser(description="PC Miner — Official MCX PoG Miner")
     parser.add_argument("--node", help="WebSocket URL (overrides discovery)")
+    parser.add_argument("--registry-url", help="Registry URL (overrides discovery)")
     parser.add_argument("--wallet", help="Wallet address")
     parser.add_argument("--privkey", help="Private key hex")
     parser.add_argument("--miner-id", help="Custom base miner ID")
@@ -4031,6 +4055,8 @@ async def main():
     args = parser.parse_args()
 
     settings = load_settings()
+    if args.registry_url:
+        settings["registry_url"] = args.registry_url
     first_run = not settings.get("wallet")
 
     # CPU-TARGET-1: resolve target precedence CLI > prompt > settings > 50.
