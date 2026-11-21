@@ -4103,22 +4103,60 @@ async def main():
             if not first_run:
                 log(f"Loaded wallet: {_c(CYN, args.wallet)}", "info", "sys0")
         else:
-            w, pk, _, pqc_pub_hex, pqc_priv_hex = generate_keypair()
-            args.wallet, args.privkey = w, pk
-            settings["wallet"] = w
-            settings["privkey"] = pk
-            if pqc_pub_hex and pqc_priv_hex:
-                settings["pqc_pub"] = pqc_pub_hex
-                settings["pqc_priv"] = pqc_priv_hex
-                pqc_pub = bytes.fromhex(pqc_pub_hex)
-                pqc_priv = bytes.fromhex(pqc_priv_hex)
-            passphrase = _get_passphrase(confirm=True)
-            if passphrase:
-                settings = _encrypt_settings_keys(settings, passphrase)
-            save_settings(settings)
-            print(f"{_c(GRN, 'Generated new wallet:')} {_c(CYN, args.wallet)}")
-            print(f"{_c(YLW, 'Private key:')} {args.privkey}")
-            print(f"{_c(RED, 'SAVE YOUR PRIVATE KEY!')}\n")
+            try:
+                _have = input(f"{_c(CYN, 'Do you have a wallet already? (y/N): ')}{RST}").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                _have = ""
+            if _have in ("y", "yes"):
+                while True:
+                    try:
+                        _pk = input(f"{_c(CYN, 'Private key hex: ')}{RST}").strip()
+                        _addr = input(f"{_c(CYN, 'Wallet address: ')}{RST}").strip()
+                    except (EOFError, KeyboardInterrupt):
+                        print(f"{_c(RED, 'Import cancelled \u2014 no wallet saved.')}{RST}")
+                        raise SystemExit(1)
+                    if _pk.startswith(("0x", "0X")):
+                        _pk = _pk[2:]
+                    if not re.fullmatch(r"[0-9a-fA-F]{64}", _pk):
+                        print(f"{_c(RED, 'Not a valid 32-byte hex private key.')}{RST}")
+                        continue
+                    if not re.fullmatch(r"0[xX][0-9a-fA-F]{40}", _addr):
+                        print(f"{_c(RED, 'Not a valid wallet address (0x + 40 hex chars).')}{RST}")
+                        continue
+                    try:
+                        _derived = pubkey_to_address(_pubkey_from_privkey(_pk))
+                    except Exception:
+                        print(f"{_c(RED, 'Could not derive an address from that private key.')}{RST}")
+                        continue
+                    if _derived.lower() != _addr.lower():
+                        print(f"{_c(RED, 'Wallet address does not match the private key!')} Typed: {_c(CYN, _addr)}  Derived: {_c(CYN, _derived)}")
+                        continue
+                    break
+                args.wallet, args.privkey = _derived, _pk
+                settings["wallet"] = _derived
+                settings["privkey"] = _pk
+                passphrase = _get_passphrase(confirm=True)
+                if passphrase:
+                    settings = _encrypt_settings_keys(settings, passphrase)
+                save_settings(settings)
+                print(f"{_c(GRN, 'Imported wallet:')} {_c(CYN, args.wallet)}")
+            else:
+                w, pk, _, pqc_pub_hex, pqc_priv_hex = generate_keypair()
+                args.wallet, args.privkey = w, pk
+                settings["wallet"] = w
+                settings["privkey"] = pk
+                if pqc_pub_hex and pqc_priv_hex:
+                    settings["pqc_pub"] = pqc_pub_hex
+                    settings["pqc_priv"] = pqc_priv_hex
+                    pqc_pub = bytes.fromhex(pqc_pub_hex)
+                    pqc_priv = bytes.fromhex(pqc_priv_hex)
+                passphrase = _get_passphrase(confirm=True)
+                if passphrase:
+                    settings = _encrypt_settings_keys(settings, passphrase)
+                save_settings(settings)
+                print(f"{_c(GRN, 'Generated new wallet:')} {_c(CYN, args.wallet)}")
+                print(f"{_c(YLW, 'Private key:')} {args.privkey}")
+                print(f"{_c(RED, 'SAVE YOUR PRIVATE KEY!')}\n")
 
     if args.wallet and args.wallet != settings.get("wallet"):
         settings["wallet"] = args.wallet
