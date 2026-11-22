@@ -1,3 +1,22 @@
+HOW TO SET UP THE MINER:
+   
+NOTE: save requirements.txt in the same folder as the pc miner file
+   
+to install all libs and modules, RUN: python -m pip install -r requirements.txt
+
+OR
+
+RUN:pip install websockets==17.4 cryptography==50.0.2 argon2-cffi==25.1.0 eth-account==0.14.0 eth-utils==6.0.0 pycryptodome==3.24.1
+
+
+
+to activate the miner, RUN: python PC_Miner.py
+   
+input ur password when prompted to, please note down this password as it would be important soon if u ever want to unencrypt the data in miner_settings.json to get the private key.
+  
+
+---—----------------
+
 the settings file is miner_settings.json where all the wallet credentials are stored. this includes the wallet address and other sensetive data. the private
 key would not be plainly stored in that file for security reasons and so it has to be encrypted. please use the show_key.py and run it in order to decrypt the data in miner_settings.json and reveal the private key, an example is shown below:
 
@@ -5,10 +24,3 @@ key would not be plainly stored in that file for security reasons and so it has 
 
 NOTE: be sure to save the show_key.py in the same folder as where the miner settings file is saved.
 
-HOW TO SET UP THE MINER:
-   NOTE: save requirements.txt in the same folder as the pc miner file
-   to install all libs and modules, RUN: python -m pip install -r requirements.txt
-   to activate the miner, RUN: python PC_Miner.py
-   
-   input ur password when prompted to, please note down this password as it would be important soon if u ever want to unencrypt the data in miner_settings.json    to get the private key.
-  
