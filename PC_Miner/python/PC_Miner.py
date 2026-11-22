@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 
 """
-for any one reading this, do install: cryptography, websockets, argon2-cffi
+for any one reading this, pls run "pip install websockets==17.4 cryptography==50.0.2 argon2-cffi==25.1.0 eth-account==0.14.0 eth-utils==6.0.0 pycryptodome==3.24.1
+" b4 running this file.
 """
 import sys, os
 try:
