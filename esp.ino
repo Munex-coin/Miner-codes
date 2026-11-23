@@ -2669,6 +2669,7 @@ static uint8_t* gLlmScratchStorage = NULL;
 static bool deriveIdentity(const char* privHexOverride) {
   const char* hx = privHexOverride;
   if (!hx || !*hx) hx = MCX_PRIVKEY_HEX;
+  if (hx && hx[0] == '0' && (hx[1] == 'x' || hx[1] == 'X')) hx += 2;  // web wallet shows 0x + 64 hex
   gPrivFromConfig = (hx && *hx);
   if (gPrivFromConfig) {
     if (!hexDecode(hx, gPriv, 32)) {
