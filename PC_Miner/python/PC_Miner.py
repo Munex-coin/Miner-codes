@@ -2138,6 +2138,7 @@ class PCMiner:
         # from another device (node rejects the duplicate miner_id).
         self._base_miner_id = self.miner_id
         self._id_suffix = 1
+        self._ever_registered = False
         self.node_url = node_url
         self._node_candidates = deque()
         self.ws = None
@@ -2326,6 +2327,13 @@ class PCMiner:
         log(f"Miner ID already connected - retrying as {self.miner_id}", "warning", "net0")
 
     async def register(self):
+        # R17: reset to the base id only on a reconnect after a live
+        # session, so the suffix does not climb forever across
+        # reconnects. A miner still trying to get in (never registered)
+        # keeps its bumped id, or a second device could never get in.
+        if self._ever_registered:
+            self.miner_id = self._base_miner_id
+            self._id_suffix = 1
         # RECONNECT-RACE-1: no move loop may run while (re)authenticating.
         self._stop_navigate("register")
         ts = int(time.time())
@@ -2367,6 +2375,7 @@ class PCMiner:
             log(f"{_c(GRN, 'Registered')} (maze init received during registration)", "info", "sys0")
             await self.handle_message(data)
             asyncio.create_task(self.fetch_balance())
+            self._ever_registered = True
             return True
 
         if data.get("type") == "registered":
@@ -2375,6 +2384,7 @@ class PCMiner:
             self.difficulty = data.get("difficulty", 1.0)
             log(f"{_c(GRN, 'Registered')} {self.miner_id[-8:]}  Balance: {_c(YLW, str(self.balance//1_000_000)+' MCX')}  Diff: {_c(CYN, str(self.difficulty))}", "info", "sys0")
             asyncio.create_task(self.fetch_balance())
+            self._ever_registered = True
             return True
 
         if data.get("type") == "registration_failed":
@@ -2412,6 +2422,7 @@ class PCMiner:
                     log(f"{_c(GRN, 'Registered')} (in round, maze init received)", "info", "sys0")
                     await self.handle_message(final_data)
                     asyncio.create_task(self.fetch_balance())
+                    self._ever_registered = True
                     return True
                 elif ft == "registered":
                     self.registered = True
@@ -3405,7 +3416,7 @@ class PCMiner:
                     await self._request_state_sync_wait()
                 except (websockets.exceptions.ConnectionClosed, OSError):
                     pass
-                if consecutive_timeouts >= 5:
+                if consecutive_timeouts >= 3:
                     log(f"Persistent stall ({consecutive_timeouts} timeouts) — attempting recovery", "warning", "net0")
                     try:
                         if self.ws and self.ws.open:
