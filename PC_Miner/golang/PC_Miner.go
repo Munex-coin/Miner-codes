@@ -345,7 +345,7 @@ func interactiveSetup(cfg *config) error {
 		switch choice {
 		case "2":
 			raw := prompt("Private key (64 hex chars)", "")
-			raw = strings.TrimPrefix(strings.TrimSpace(raw), "0x")
+			raw = strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(raw), "0x"), "0X")
 			if len(raw) != 64 {
 				return errors.New("private key must be 64 hex characters")
 			}
@@ -402,7 +402,7 @@ func saveWalletFromHex(privHex string) error {
 		return err
 	}
 	walletData := map[string]string{
-		"privkey":    strings.TrimPrefix(privHex, "0x"),
+		"privkey":    strings.TrimPrefix(strings.TrimPrefix(privHex, "0x"), "0X"),
 		"public_key": key.public,
 		"wallet":     key.wallet,
 		"miner_id":   key.minerID,
@@ -457,7 +457,7 @@ func envOr(name string, fallback string) string {
 }
 
 func keyFromHex(raw string) (*minerKey, error) {
-	raw = strings.TrimPrefix(strings.TrimSpace(raw), "0x")
+	raw = strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(raw), "0x"), "0X")
 	keyBytes, err := hex.DecodeString(raw)
 	if err != nil {
 		return nil, err
