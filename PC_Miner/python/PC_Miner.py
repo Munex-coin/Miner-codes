@@ -608,12 +608,14 @@ def fetch_registry_nodes(url):
 async def discover_nodes(settings: dict) -> list:
     """Return a list of candidate WS URLs to try, ordered:
        1. the user-pinned node_url (if any)
-       2. hardcoded bootstrap_nodes from settings
-       3. the Munex registry (nodes list; skipped if unreachable)
-       4. cached peers from miner_peers.json (freshest first, dead ones skipped)
-       5. DNS seeds as a last resort
+       2. the Munex registry (nodes list; the primary source)
+       3. cached peers from miner_peers.json (freshest first, dead ones skipped)
+       4. hardcoded bootstrap_nodes / DNS seeds - LAST RESORT ONLY,
+          tried after every registry node and cached peer. The seed is a
+          true fallback, not the default every miner uses.
     The pinned head stays at position 0; the rest are shuffled so repeated
-    attempts don't hammer the same dead URL forever."""
+    attempts don't hammer the same dead URL forever. The last-resort seed
+    entries are appended after the shuffle, so they are always tried last."""
     candidates, seen = [], set()
     def add(u):
         if u and u not in seen:
@@ -621,13 +623,8 @@ async def discover_nodes(settings: dict) -> list:
 
     add(settings.get("node_url"))
 
-    for u in (settings.get("bootstrap_nodes") or []):
-        add(u)
-
     for u in fetch_registry_nodes(settings.get("registry_url", REGISTRY_URL_DEFAULT)):
         add(u)
-    if not candidates:
-        add(settings.get("fallback_node", FALLBACK_NODE))
 
     for url, meta in sorted(_load_miner_peers().items(),
                             key=lambda kv: kv[1].get("last_seen", 0), reverse=True):
@@ -635,15 +632,22 @@ async def discover_nodes(settings: dict) -> list:
             continue
         add(url)
 
-    for seed in settings.get("dns_seeds", DNS_SEEDS):
-        host = seed.split("://")[-1].split(":")[0].split("/")[0]
-        for u in resolve_dns(host, int(settings.get("ws_port", WS_DEFAULT_PORT))):
-            add(u)
-
     if len(candidates) > 1:
         head, tail = candidates[:1], candidates[1:]
         random.shuffle(tail)
         candidates = head + tail
+
+    # True last resort, always after every registry node and cached peer,
+    # and never shuffled ahead of them. Only reached when the registry
+    # gave nothing usable (or every registry node failed).
+    for u in (settings.get("bootstrap_nodes") or []):
+        add(u)
+    if not candidates:
+        add(settings.get("fallback_node", FALLBACK_NODE))
+    for seed in settings.get("dns_seeds", DNS_SEEDS):
+        host = seed.split("://")[-1].split(":")[0].split("/")[0]
+        for u in resolve_dns(host, int(settings.get("ws_port", WS_DEFAULT_PORT))):
+            add(u)
     return candidates
 
 
