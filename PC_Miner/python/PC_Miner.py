@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 
 """
-for any one reading this, pls run "pip install websockets==17.4 cryptography==50.0.2 argon2-cffi==25.1.0 eth-account==0.14.0 eth-utils==6.0.0 pycryptodome==3.24.1
-" b4 running this file.
+for any one reading this, do install: cryptography, websockets, argon2-cffi
 """
 import sys, os
 try:
@@ -2135,6 +2134,10 @@ class PCMiner:
         else:
             base_id = miner_id
         self.miner_id = f"{base_id}_{core_suffix}" if core_suffix else base_id
+        # R15: base id for auto-suffix when this wallet is already mining
+        # from another device (node rejects the duplicate miner_id).
+        self._base_miner_id = self.miner_id
+        self._id_suffix = 1
         self.node_url = node_url
         self._node_candidates = deque()
         self.ws = None
@@ -2314,6 +2317,14 @@ class PCMiner:
                 pass
             self.ws = None
 
+    def _bump_miner_id(self):
+        # R15: the node rejected this miner_id as already connected from
+        # another device. Retry with a distinct id so this instance gets
+        # its own maze (R14) instead of displacing the other miner.
+        self._id_suffix += 1
+        self.miner_id = f"{self._base_miner_id}_{self._id_suffix}"
+        log(f"Miner ID already connected - retrying as {self.miner_id}", "warning", "net0")
+
     async def register(self):
         # RECONNECT-RACE-1: no move loop may run while (re)authenticating.
         self._stop_navigate("register")
@@ -2368,6 +2379,8 @@ class PCMiner:
 
         if data.get("type") == "registration_failed":
             err = data.get("error", "unknown")
+            if "already connected" in str(err).lower():
+                self._bump_miner_id()
             log(f"{_c(RED, 'Registration REJECTED by node')}: {err}", "error", "net0")
             return False
 
@@ -2407,6 +2420,9 @@ class PCMiner:
                     log(f"{_c(GRN, 'Registered')}  Balance: {_c(YLW, str(self.balance//1_000_000)+' MCX')}", "info", "sys0")
                     asyncio.create_task(self.fetch_balance())
                 elif ft == "registration_failed":
+                    _err = final_data.get("error", "")
+                    if "already connected" in str(_err).lower():
+                        self._bump_miner_id()
                     log(f"{_c(RED, 'Registration failed after challenge')}", "error", "net0")
                     return False
                 elif ft == "error":
