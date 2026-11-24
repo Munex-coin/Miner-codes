@@ -297,7 +297,10 @@ DIR_OFFSETS = [(1,0,0), (-1,0,0), (0,1,0), (0,-1,0), (0,0,1), (0,0,-1)]
 DIR_OFFSET_TO_IDX = {off: i for i, off in enumerate(DIR_OFFSETS)}
 
 MOVE_TIMEOUT = 15.0
-HEARTBEAT_INTERVAL = 5
+# POLISH-3: uptime_ping every 5 s was 86% of a miner's
+# non-exempt traffic (12/min of ~14/min) though the node's
+# cleanup window is 60 s. 25 s still pings 2+ times per window.
+HEARTBEAT_INTERVAL = 25
 MAX_RECONNECT = 5
 STATE_SYNC_COOLDOWN = 2.0
 POW_DIFFICULTY = 16
@@ -2238,6 +2241,13 @@ class PCMiner:
         self._last_sync_time = 0.0
         self._consecutive_wall_hits = 0
         self._sync_event = asyncio.Event()
+        # POLISH: state sync fail-fast + backoff (M3), throttled
+        # Node-error log (M2), reconnect backoff (M4).
+        self._sync_waiting = False
+        self._sync_error = None
+        self._sync_failures = 0
+        self._node_err_last_log = 0.0
+        self._backoff_n = 0
         self._nav_start_time = 0.0
         self._last_move_time = 0.0
         self.prev_state = None
@@ -2278,6 +2288,18 @@ class PCMiner:
         self._cpu_last_log = 0.0
         self._cpu_actual = 0.0
         self._cpu_task = None
+
+    def _reconnect_delay(self):
+        # POLISH-4: exponential backoff with jitter for reconnect /
+        # register retries: 5 s, 10 s, 20 s, 40 s, 60 s cap, + up
+        # to 2 s jitter. Resets to 5 s on a successful registration
+        # (in register()), so a miner that mined fine for hours
+        # reconnects fast after one drop instead of hammering the
+        # node every 1 s / 10 s in lockstep with every other miner.
+        n = getattr(self, "_backoff_n", 0)
+        base = min(5.0 * (2 ** n), 60.0)
+        self._backoff_n = n + 1
+        return base + random.uniform(0, 2.0)
 
     async def connect(self, url=None):
         if url is None:
@@ -2340,6 +2362,33 @@ class PCMiner:
             self._id_suffix = 1
         # RECONNECT-RACE-1: no move loop may run while (re)authenticating.
         self._stop_navigate("register")
+        # POLISH-5: retry the base id once before bumping to _2.
+        # The node rejects a re-register as "already connected"
+        # while its old socket for this id is still in
+        # miner_websockets (the close races the re-register); a
+        # 2 s retry lands after the node's cleanup and keeps the
+        # base id (and its maze). Only the base id is retried —
+        # a suffixed id bumps at once, and a genuine second device
+        # still gets _2 after one retry. A successful registration
+        # resets the reconnect backoff (POLISH-4).
+        for _attempt in (0, 1):
+            _ok, _already = await self._register_once()
+            if _ok:
+                self._backoff_n = 0
+                return True
+            if not _already or _attempt == 1 or self.miner_id != self._base_miner_id:
+                break
+            log(f"miner_id {self.miner_id[-8:]} still held by a stale socket — retrying base id once after 2 s", "warning", "net0")
+            await asyncio.sleep(2)
+        if _already:
+            self._bump_miner_id()
+        return False
+
+    async def _register_once(self):
+        # One registration attempt. Returns (ok, already_connected):
+        # already_connected is True only when the node rejected this
+        # id as live on another socket — the case register() retries
+        # once before bumping. All other failures return False, False.
         ts = int(time.time())
         sig = sign_message(self.privkey, f"{self.miner_id}{self.wallet}{ts}")
         payload = {
@@ -2372,7 +2421,7 @@ class PCMiner:
                 raise TimeoutError("no registration response")
         except Exception as e:
             log(f"{_c(RED, 'Registration error')} for {self.miner_id[-8:]}: {e}", "error", "net0")
-            return False
+            return False, False
 
         if data.get("type") == "maze_init":
             self.registered = True
@@ -2380,7 +2429,7 @@ class PCMiner:
             await self.handle_message(data)
             asyncio.create_task(self.fetch_balance())
             self._ever_registered = True
-            return True
+            return True, False
 
         if data.get("type") == "registered":
             self.registered = True
@@ -2389,14 +2438,13 @@ class PCMiner:
             log(f"{_c(GRN, 'Registered')} {self.miner_id[-8:]}  Balance: {_c(YLW, str(self.balance//1_000_000)+' MCX')}  Diff: {_c(CYN, str(self.difficulty))}", "info", "sys0")
             asyncio.create_task(self.fetch_balance())
             self._ever_registered = True
-            return True
+            return True, False
 
         if data.get("type") == "registration_failed":
             err = data.get("error", "unknown")
-            if "already connected" in str(err).lower():
-                self._bump_miner_id()
+            _already = "already connected" in str(err).lower()
             log(f"{_c(RED, 'Registration REJECTED by node')}: {err}", "error", "net0")
-            return False
+            return False, _already
 
         if data.get("type") == "memory_challenge_request":
             seed = base64.b64decode(data["seed"])
@@ -2418,7 +2466,7 @@ class PCMiner:
                     raw = await asyncio.wait_for(self.ws.recv(), timeout=deadline_loop - time.time())
                 except asyncio.TimeoutError:
                     log(f"{_c(RED, 'Registration timed out after challenge')}", "error", "net0")
-                    return False
+                    return False, False
                 final_data = json.loads(raw)
                 ft = final_data.get("type")
                 if ft == "maze_init":
@@ -2427,7 +2475,7 @@ class PCMiner:
                     await self.handle_message(final_data)
                     asyncio.create_task(self.fetch_balance())
                     self._ever_registered = True
-                    return True
+                    return True, False
                 elif ft == "registered":
                     self.registered = True
                     self.balance = final_data.get("confirmed_balance", 0)
@@ -2436,17 +2484,16 @@ class PCMiner:
                     asyncio.create_task(self.fetch_balance())
                 elif ft == "registration_failed":
                     _err = final_data.get("error", "")
-                    if "already connected" in str(_err).lower():
-                        self._bump_miner_id()
+                    _already = "already connected" in str(_err).lower()
                     log(f"{_c(RED, 'Registration failed after challenge')}", "error", "net0")
-                    return False
+                    return False, _already
                 elif ft == "error":
                     log(f"{_c(RED, 'NODE ERROR')}: {final_data.get('message')}", "error", "net0")
-                    return False
+                    return False, False
             log(f"{_c(RED, 'Registration failed')}: no maze_init after registered", "error", "net0")
-            return False
+            return False, False
         log(f"{_c(RED, 'Unexpected registration response')}", "error", "net0")
-        return False
+        return False, False
 
     async def fetch_balance(self):
         if self.ws and self.registered:
@@ -2485,14 +2532,29 @@ class PCMiner:
             log("State sync skipped (standing on sealed cell) -- nonce already adopted from rejection", "warning", "pog0")
             return
         self._sync_event.clear()
+        self._sync_error = None
+        self._sync_waiting = True
         try:
             self._last_sync_time = time.time()
             await self.ws.send(json.dumps({"type": "get_maze_state", "miner_id": self.miner_id, "maze_id": self.maze_id}))
             await asyncio.wait_for(self._sync_event.wait(), timeout=MOVE_TIMEOUT)
+            if self._sync_error:
+                # POLISH-3: the node refused the sync — fail fast
+                # instead of waiting the full 15 s, then back off
+                # (1 s, 2 s, 4 s, 8 s cap + jitter).
+                self._sync_failures = getattr(self, "_sync_failures", 0) + 1
+                log(f"State sync refused for {self.miner_id[-8:]}: {self._sync_error} — backing off", "warning", "net0")
+                await asyncio.sleep(min(1.0 * (2 ** min(self._sync_failures, 3)), 8.0) + random.uniform(0, 0.5))
+                return
+            self._sync_failures = 0
         except asyncio.TimeoutError:
+            self._sync_failures = getattr(self, "_sync_failures", 0) + 1
             log(f"State sync timed out for {self.miner_id[-8:]}", "warning", "net0")
+            await asyncio.sleep(min(1.0 * (2 ** min(self._sync_failures, 3)), 8.0) + random.uniform(0, 0.5))
         except Exception as e:
             log(f"State sync error for {self.miner_id[-8:]}: {e}", "warning", "net0")
+        finally:
+            self._sync_waiting = False
 
     async def solve_pow_async(self, seed, difficulty):
         loop = asyncio.get_event_loop()
@@ -3440,8 +3502,9 @@ class PCMiner:
                     except Exception as e:
                         log(f"Recovery reconnect failed: {e}", "error", "net0")
                     return
-                elif consecutive_timeouts >= 3:
-                    await asyncio.sleep(1)
+                # POLISH-6: an elif consecutive_timeouts >= 3
+                # was here; it was unreachable — the if >= 3
+                # above it returns.
                 else:
                     await asyncio.sleep(0.3)
             except Exception as e:
@@ -3794,9 +3857,24 @@ class PCMiner:
                     f"not counted", "warning", "sys0")
 
         elif msg_type == "error":
-            log(f"Node error: {data.get('message')}", "error", "sys0")
-            if self.pending_ack and not self.pending_ack.done():
-                self.pending_ack.set_result(data)
+            # POLISH-2: an "error" reply is never a move ack —
+            # resolving pending_ack with it let a stray error
+            # (e.g. a rate-limit reply to a concurrent ping)
+            # hijack the in-flight move wait, causing phantom
+            # rejections + resync storms. The move wait times out
+            # on its own if the move itself was refused. Log
+            # throttled (once per 30 s) so a sustained error
+            # storm does not spam the log.
+            _now = time.time()
+            if _now - getattr(self, "_node_err_last_log", 0.0) >= 30.0:
+                self._node_err_last_log = _now
+                log(f"Node error: {data.get('message')}", "error", "sys0")
+            if getattr(self, "_sync_waiting", False):
+                # POLISH-3: an error arriving while a state sync
+                # is waiting fails the sync fast instead of
+                # burning the full 15 s MOVE_TIMEOUT.
+                self._sync_error = data.get("message", "error")
+                self._sync_event.set()
 
         elif msg_type == "peers":
             cache = _load_miner_peers()
@@ -3988,7 +4066,7 @@ class PCMiner:
                                 except (asyncio.CancelledError, Exception):
                                     pass
                             self.nav_task = None
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(self._reconnect_delay())
                     continue
 
             if not await self.connect(self.node_url):
@@ -3998,7 +4076,7 @@ class PCMiner:
                     log(f"Giving up on {self.node_url}, trying next...", "warning", "net0")
                     self.node_url = self._node_candidates.popleft() if self._node_candidates else None
                     self.reconn_attempts = 0
-                await asyncio.sleep(5)
+                await asyncio.sleep(self._reconnect_delay())
                 continue
 
             if await self.register():
@@ -4038,8 +4116,8 @@ class PCMiner:
                         log("Old connection closed but recovery active, keeping new connection", "info", "net0")
             else:
                 log("Registration failed, retrying...", "warning", "net0")
-                await asyncio.sleep(10)
-            await asyncio.sleep(1)
+                await asyncio.sleep(self._reconnect_delay())
+            await asyncio.sleep(self._reconnect_delay())
 
         if self.heartbeat_task:
             self.heartbeat_task.cancel()
