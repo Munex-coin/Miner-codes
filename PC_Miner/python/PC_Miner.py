@@ -289,6 +289,15 @@ DEFAULT_SETTINGS = {
 DNS_SEEDS = ["munexseed1.duckdns.org"]
 REGISTRY_URL_DEFAULT = "https://munex-registry.animax-plorer22.workers.dev/nodes"
 FALLBACK_NODE = "ws://munexseed1.duckdns.org:8080/ws"
+
+# TUNNEL-PARITY-1: registry-first discovery cache. A reconnect ALWAYS
+# consults the registry first: the fetched list is reused for at most
+# REGISTRY_CACHE_TTL seconds, then re-fetched; a re-fetch is forced when
+# the candidate list is exhausted. The DNS seed is never consulted first.
+REGISTRY_CACHE_TTL = 60.0
+# Last registry fetch: {"url", "fetched_at", "urls"}. Empty "urls" means
+# the last fetch failed or the registry listed no nodes.
+_REGISTRY_CACHE = {"url": None, "fetched_at": 0.0, "urls": []}
 WS_PATH = "/ws"
 WS_DEFAULT_PORT = 8080
 
@@ -296,7 +305,26 @@ DIR_NAMES = ["east", "west", "north", "south", "up", "down"]
 DIR_OFFSETS = [(1,0,0), (-1,0,0), (0,1,0), (0,-1,0), (0,0,1), (0,0,-1)]
 DIR_OFFSET_TO_IDX = {off: i for i, off in enumerate(DIR_OFFSETS)}
 
-MOVE_TIMEOUT = 15.0
+# R24: 15 s was shorter than a single size-16 catch maze
+# generation (measured ~17 s), so every catch timed out.
+# 30 s covers one catch; the ACK-before-maze restructure
+# (which removes the generation from the ACK path) is
+# deferred to avoid risking maze-state consistency.
+MOVE_TIMEOUT = 30.0
+# R35 M5: re-send get_maze_state every SYNC_RESEND_INTERVAL while
+# a state-sync reply is outstanding (see _request_state_sync_wait).
+# 5 s is far above the normal sub-second reply latency and 6x below
+# the dead 30 s wait; at most 5 extra requests per wait, far below
+# the node's 60/60 s per-miner WS budget for non-exempt messages.
+SYNC_RESEND_INTERVAL = 5.0
+# R30: a move that lands on the goal is a catch; the node then generates
+# a brand-new maze (cold, 16 s at size 15, 54-72 s at 19, ~120 s at 22)
+# before it can ack, so the 30 s MOVE_TIMEOUT fires on every catch at
+# size >=17 (R24 raised it 15->30 s, which only covered size 16). The
+# miner knows a move is a catch before sending it (next_pos == goal),
+# so it waits longer for that ack only. 240 s covers the measured cold
+# generation up to size ~22. Non-catch moves keep 30 s.
+CATCH_MOVE_TIMEOUT = 240.0
 # POLISH-3: uptime_ping every 5 s was 86% of a miner's
 # non-exempt traffic (12/min of ~14/min) though the node's
 # cleanup window is 60 s. 25 s still pings 2+ times per window.
@@ -593,32 +621,67 @@ def resolve_dns(domain, port=WS_DEFAULT_PORT):
     return urls
 
 def fetch_registry_nodes(url):
+    """Fetch the registry's node list. Returns (urls, error): urls is the
+    list of ws_url values (wss:// tunnel URLs included, on equal footing
+    with ws:// IP URLs); error is None on success, else a short reason.
+    A failure returns ([], reason) -- the caller logs it and falls back to
+    the cached list / last-resort seed, never silently."""
     urls = []
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "munex-miner/1.0", "Accept": "application/json"})
         with urllib.request.urlopen(req, timeout=5) as res:
             if res.status != 200:
-                return urls
+                return urls, f"HTTP {res.status}"
             data = json.loads(res.read().decode("utf-8", "replace"))
         for n in (data.get("nodes") or []):
             if isinstance(n, dict) and n.get("ws_url"):
                 urls.append(str(n["ws_url"]))
-    except Exception:
-        pass
-    return urls
+    except Exception as e:
+        return urls, f"{type(e).__name__}: {e}"
+    return urls, None
 
 
-async def discover_nodes(settings: dict) -> list:
+def _fetch_registry_cached(url, force_refresh=False):
+    """Registry fetch with a TTL cache (TUNNEL-PARITY-1). Returns
+    (urls, error, from_cache): urls is the node list to use, error is the
+    fetch error or None, from_cache says the list came from the cache.
+    A fresh fetch is forced when force_refresh is set or the cached entry
+    is stale (> REGISTRY_CACHE_TTL) or for another URL. A failed fresh
+    fetch reuses the previous cached list (stale) when one exists, so a
+    blip in the registry does not drop the miner to the seed; with no
+    cached list the caller falls back to cached peers / last-resort seed."""
+    global _REGISTRY_CACHE
+    now = time.time()
+    if (not force_refresh and _REGISTRY_CACHE.get("url") == url
+            and now - _REGISTRY_CACHE.get("fetched_at", 0.0) < REGISTRY_CACHE_TTL):
+        return list(_REGISTRY_CACHE["urls"]), None, True
+    urls, err = fetch_registry_nodes(url)
+    if err is None:
+        _REGISTRY_CACHE = {"url": url, "fetched_at": now, "urls": list(urls)}
+        return list(urls), None, False
+    if _REGISTRY_CACHE.get("urls") and _REGISTRY_CACHE.get("url") == url:
+        return list(_REGISTRY_CACHE["urls"]), err, True
+    _REGISTRY_CACHE = {"url": url, "fetched_at": now, "urls": []}
+    return [], err, False
+
+
+async def discover_nodes(settings: dict, force_refresh: bool = False) -> list:
     """Return a list of candidate WS URLs to try, ordered:
-       1. the user-pinned node_url (if any)
-       2. the Munex registry (nodes list; the primary source)
+       1. the user-pinned node_url (if any) -- the ONLY path that may skip
+          the registry, by explicit user choice (--node / node_url).
+       2. the Munex registry (nodes list; the primary source) -- fetched
+          FIRST on every call (fresh fetch when the TTL cache is stale,
+          cached list otherwise); the fetch is logged with its URL and
+          node counts (IP ws:// vs tunnel wss://) before anything else.
        3. cached peers from miner_peers.json (freshest first, dead ones skipped)
-       4. hardcoded bootstrap_nodes / DNS seeds - LAST RESORT ONLY,
-          tried after every registry node and cached peer. The seed is a
-          true fallback, not the default every miner uses.
+       4. hardcoded bootstrap_nodes / DNS seeds -- LAST RESORT ONLY, and
+          only when the registry gave NOTHING usable this round (fetch
+          failed or empty list). When the registry lists nodes, the DNS
+          seed hostnames are not even resolved.
+    Tunnel (wss://) and IP (ws://) registry entries are tried on equal
+    footing: same list, same shuffle, same retry/backoff in run().
     The pinned head stays at position 0; the rest are shuffled so repeated
-    attempts don't hammer the same dead URL forever. The last-resort seed
-    entries are appended after the shuffle, so they are always tried last."""
+    attempts don't hammer the same dead URL forever."""
     candidates, seen = [], set()
     def add(u):
         if u and u not in seen:
@@ -626,7 +689,21 @@ async def discover_nodes(settings: dict) -> list:
 
     add(settings.get("node_url"))
 
-    for u in fetch_registry_nodes(settings.get("registry_url", REGISTRY_URL_DEFAULT)):
+    _reg_url = settings.get("registry_url", REGISTRY_URL_DEFAULT)
+    _reg_urls, _reg_err, _reg_cached = _fetch_registry_cached(_reg_url, force_refresh=force_refresh)
+    _n_ip = sum(1 for u in _reg_urls if u.startswith("ws://"))
+    _n_tun = sum(1 for u in _reg_urls if u.startswith("wss://"))
+    if _reg_err is None:
+        log(f"Registry fetch: {_reg_url} -> {len(_reg_urls)} nodes "
+            f"({_n_ip} IP ws://, {_n_tun} tunnel wss://)"
+            f"{' (cached)' if _reg_cached else ''}", "info", "net0")
+    else:
+        log(f"Registry fetch FAILED: {_reg_url} ({_reg_err})"
+            f"{' -- reusing cached list' if _reg_cached else ' -- no cached list'}", "warning", "net0")
+        if _reg_cached:
+            log(f"Registry fetch: {_reg_url} -> {len(_reg_urls)} nodes "
+                f"({_n_ip} IP ws://, {_n_tun} tunnel wss://) (stale cache)", "info", "net0")
+    for u in _reg_urls:
         add(u)
 
     for url, meta in sorted(_load_miner_peers().items(),
@@ -640,17 +717,24 @@ async def discover_nodes(settings: dict) -> list:
         random.shuffle(tail)
         candidates = head + tail
 
-    # True last resort, always after every registry node and cached peer,
-    # and never shuffled ahead of them. Only reached when the registry
-    # gave nothing usable (or every registry node failed).
-    for u in (settings.get("bootstrap_nodes") or []):
-        add(u)
-    if not candidates:
-        add(settings.get("fallback_node", FALLBACK_NODE))
-    for seed in settings.get("dns_seeds", DNS_SEEDS):
-        host = seed.split("://")[-1].split(":")[0].split("/")[0]
-        for u in resolve_dns(host, int(settings.get("ws_port", WS_DEFAULT_PORT))):
+    # True last resort, ONLY when the registry gave nothing usable this
+    # round (fetch failed or empty list). When the registry lists nodes,
+    # the seed hostnames are not resolved at all -- no path reaches the
+    # DNS seed without trying the registry first.
+    if not _reg_urls:
+        log("Registry gave no nodes -- adding last-resort seed entries", "warning", "net0")
+        for u in (settings.get("bootstrap_nodes") or []):
             add(u)
+        if not candidates:
+            add(settings.get("fallback_node", FALLBACK_NODE))
+        for seed in settings.get("dns_seeds", DNS_SEEDS):
+            host = seed.split("://")[-1].split(":")[0].split("/")[0]
+            _resolved = resolve_dns(host, int(settings.get("ws_port", WS_DEFAULT_PORT)))
+            log(f"DNS seed resolution: {host} -> {_resolved}", "info", "net0")
+            for u in _resolved:
+                add(u)
+    else:
+        log(f"Registry gave {len(_reg_urls)} nodes -- DNS seeds NOT resolved this round (registry-first)", "info", "net0")
     return candidates
 
 
@@ -2127,11 +2211,11 @@ class PCMiner:
             # IDEA5-MAZE-KEY-BINDING-1: stable id derived from the maze key so
             # verifiers can recompute it from the attestation pubkey alone:
             #   PC_ + sha256(pubkey_to_address(mazepub) + "_mcx_miner")[:32]
-            # SINGLE-KEY MODE: main() passes the identity keypair as the maze
-            # keypair, so this derivation coincides with the identity-key
-            # derivation the node requires at register
-            # (R5-register-pc-derivation). Do not pass a distinct maze key —
-            # registration rejects it.
+            # R24: the node derives the expected miner_id from
+            # block_signing_pub (the maze key), while still verifying
+            # the register signature against the identity pub_key, so
+            # a distinct maze key is usable again and gives this
+            # miner its own stable id.
             if mazepub:
                 digest = hashlib.sha256(f"{pubkey_to_address(mazepub)}_mcx_miner".encode()).hexdigest()[:32].upper()
             else:
@@ -2145,9 +2229,20 @@ class PCMiner:
         # from another device (node rejects the duplicate miner_id).
         self._base_miner_id = self.miner_id
         self._id_suffix = 1
+        self.core_suffix = core_suffix
+        # R24: maze_keys list from load_wallet_full(), set by main();
+        # None until then - _register_once loads it from disk on demand.
+        self._maze_keys = None
         self._ever_registered = False
         self.node_url = node_url
         self._node_candidates = deque()
+        # TUNNEL-PARITY-1: reconnect bookkeeping. _session_dropped is set
+        # when a live session's socket drops, so the next loop iteration
+        # re-consults the registry (TTL cache) before reconnecting.
+        # _discovery_force_refresh is set when the candidate list is
+        # exhausted, so the next discovery bypasses the TTL cache.
+        self._session_dropped = False
+        self._discovery_force_refresh = False
         self.ws = None
         self.registered = False
         self.balance = 0
@@ -2215,6 +2310,10 @@ class PCMiner:
         self._pace_walls = deque(maxlen=PACE_WALL_WINDOW)
         self._pace_last_log = 0.0
         self._pace_last_rl_log = 0.0
+        # TUNNEL-PARITY-2: wall-clock time of the last observed node
+        # rate-limit (429) response; 0.0 means none ever observed. The
+        # CPU governor consults this before ever mentioning rate limits.
+        self._rate_limited_seen_at = 0.0
 
         # CPU-TARGET-3: numpy D3QN when available (BLAS threads sized from the
         # CPU target; one core stays free below 95% so the websocket loop
@@ -2228,6 +2327,7 @@ class PCMiner:
         self.dqn.load()
 
         self.nav_task = None
+        self._recovery_task = None  # R35 M2: reconnect task (never the nav task itself)
         self.pending_ack = None
         self.heartbeat_task = None
         self.balance_task = None
@@ -2236,6 +2336,7 @@ class PCMiner:
         self.start_time = 0.0
         self.last_move_duration = 0.0
         self.pow_pending = False
+        self._pow_pending_since = 0.0  # R35 M1: when pow_pending was set (wedge guard)
         self.last_ping = 0.0
         self.last_message_time = time.time()
         self._last_sync_time = 0.0
@@ -2406,7 +2507,12 @@ class PCMiner:
             data = None
             t0 = time.time()
             while time.time() - t0 < 30:
-                raw = await asyncio.wait_for(self.ws.recv(), timeout=30 - (time.time() - t0))
+                try:
+                    raw = await asyncio.wait_for(self.ws.recv(), timeout=30 - (time.time() - t0))
+                except asyncio.TimeoutError:
+                    # R24: bare asyncio.TimeoutError has an empty str(),
+                    # which logged as a bare "Registration error: ".
+                    raise TimeoutError("no registration response within 30s")
                 cand = json.loads(raw)
                 ct = cand.get("type", "")
                 if ct in ("memory_challenge_request", "registered", "registration_failed"):
@@ -2418,7 +2524,7 @@ class PCMiner:
                 else:
                     continue
             if data is None:
-                raise TimeoutError("no registration response")
+                raise TimeoutError("no registration response within 30s")
         except Exception as e:
             log(f"{_c(RED, 'Registration error')} for {self.miner_id[-8:]}: {e}", "error", "net0")
             return False, False
@@ -2467,6 +2573,13 @@ class PCMiner:
                 except asyncio.TimeoutError:
                     log(f"{_c(RED, 'Registration timed out after challenge')}", "error", "net0")
                     return False, False
+                except (websockets.exceptions.ConnectionClosed, OSError) as e:
+                    # R30: the node may close the WS while it generates a grown
+                    # maze for MAZE_INIT (cold, ~174 s at size 22, past the 60 s
+                    # inactivity cleanup). Without this the close kills the miner;
+                    # return False so run() retries (the maze is warm then).
+                    log(f"{_c(RED, 'Registration connection closed after challenge')}: {e}", "error", "net0")
+                    return False, False
                 final_data = json.loads(raw)
                 ft = final_data.get("type")
                 if ft == "maze_init":
@@ -2488,6 +2601,37 @@ class PCMiner:
                     log(f"{_c(RED, 'Registration failed after challenge')}", "error", "net0")
                     return False, _already
                 elif ft == "error":
+                    _err_msg = str(final_data.get("message") or final_data.get("error") or "")
+                    if "Maze already in use" in _err_msg:
+                        # R24: this maze key is already owned by a
+                        # different connected miner on this wallet.
+                        # Retrying with the same key would fail
+                        # forever, so mint a fresh distinct maze
+                        # keypair (persisted BEFORE re-registering,
+                        # so a crash cannot lose it), re-derive the
+                        # miner_id from the new maze pub, and
+                        # register again with the new key.
+                        log(f"{_c(YLW, 'Maze already in use by another miner')} - generating a new maze key and re-registering", "warning", "net0")
+                        _maze_keys = getattr(self, "_maze_keys", None)
+                        if _maze_keys is None:
+                            try:
+                                _maze_keys = load_wallet_full()[2]
+                            except Exception:
+                                _maze_keys = []
+                            self._maze_keys = _maze_keys
+                        _mp, _mz = new_maze_key(_maze_keys)
+                        self.mazepriv = _mp
+                        self.mazepub = _mz
+                        self.maze_id = _mz
+                        self.registered = False
+                        _digest = hashlib.sha256(f"{pubkey_to_address(_mz)}_mcx_miner".encode()).hexdigest()[:32].upper()
+                        _base = f"PC_{_digest}"
+                        _suffix = getattr(self, "core_suffix", "")
+                        self.miner_id = f"{_base}_{_suffix}" if _suffix else _base
+                        self._base_miner_id = self.miner_id
+                        self._id_suffix = 1
+                        self._ever_registered = False
+                        return await self._register_once()
                     log(f"{_c(RED, 'NODE ERROR')}: {final_data.get('message')}", "error", "net0")
                     return False, False
             log(f"{_c(RED, 'Registration failed')}: no maze_init after registered", "error", "net0")
@@ -2537,7 +2681,35 @@ class PCMiner:
         try:
             self._last_sync_time = time.time()
             await self.ws.send(json.dumps({"type": "get_maze_state", "miner_id": self.miner_id, "maze_id": self.maze_id}))
-            await asyncio.wait_for(self._sync_event.wait(), timeout=MOVE_TIMEOUT)
+            # R35 M5: a reply dropped on a live connection used to burn
+            # the whole MOVE_TIMEOUT (30 s) before the miner retried,
+            # then a backoff -- 37-40 s to the next accepted move.
+            # Re-send get_maze_state every SYNC_RESEND_INTERVAL while
+            # the reply is outstanding, instead. A reply normally
+            # arrives in well under 1 s, so 5 s adds no traffic in
+            # the common case; it also covers a lost REQUEST, not
+            # just a lost reply. The total wait is still exactly
+            # MOVE_TIMEOUT, so the TimeoutError handler below (log +
+            # backoff) still fires on a genuinely dead node.
+            _sync_deadline = time.time() + MOVE_TIMEOUT
+            while True:
+                _remaining = _sync_deadline - time.time()
+                if _remaining <= 0:
+                    raise asyncio.TimeoutError()
+                try:
+                    await asyncio.wait_for(self._sync_event.wait(), timeout=min(SYNC_RESEND_INTERVAL, _remaining))
+                    break
+                except asyncio.TimeoutError:
+                    if time.time() >= _sync_deadline:
+                        raise
+                    if self.ws is None or not self.registered:
+                        raise asyncio.TimeoutError()
+                    try:
+                        self._last_sync_time = time.time()
+                        await self.ws.send(json.dumps({"type": "get_maze_state", "miner_id": self.miner_id, "maze_id": self.maze_id}))
+                    except (websockets.exceptions.ConnectionClosed, OSError):
+                        raise asyncio.TimeoutError()
+                    log("State sync still waiting -- re-sent get_maze_state", "warning", "net0")
             if self._sync_error:
                 # POLISH-3: the node refused the sync — fail fast
                 # instead of waiting the full 15 s, then back off
@@ -2620,6 +2792,68 @@ class PCMiner:
         self._cpu_intensity = inten
         return inten
 
+    def _cpu_below_message(self, pct, target):
+        """R35 M4 + R36 tunnel merge: CPU-below-target hint, chosen from observed state.
+
+        The governor has no input about registration, maze state, or
+        throttling, so blaming the node's rate limits on any idle
+        moment was misleading (it fired at the first idle moment,
+        e.g. registered with no maze yet, never throttled). The only
+        real evidence of throttling is an observed 429, which doubles
+        _pace_backoff via _note_rate_limited(). R36 adds the tunnel
+        stamp: _note_rate_limited() also records _rate_limited_seen_at,
+        so a 429 stays visible for 5 minutes even after _pace_backoff
+        has decayed back to 1.0. Rate limits are blamed only when one
+        was actually observed (backoff > 1.0 with recent move activity);
+        otherwise the message says what is known -- what the miner is
+        waiting on. Pure apart from attribute reads; unit-testable."""
+        try:
+            _backoff = float(getattr(self, "_pace_backoff", 1.0))
+        except (TypeError, ValueError):
+            _backoff = 1.0
+        _last_move = float(getattr(self, "_last_move_time", 0.0) or 0.0)
+        _recent_move = _last_move > 0.0 and (time.time() - _last_move) < 60.0
+        # R36 (tunnel TUNNEL-PARITY-2): wall-clock recency of the last
+        # observed 429, independent of the decaying _pace_backoff.
+        _rl_recent = (time.time() - float(getattr(self, "_rate_limited_seen_at", 0.0) or 0.0)) < 300.0
+        _hint = ("" if isinstance(self.dqn, D3QNAgent)
+                 else "Install numpy (pip install numpy) for multi-core D3QN training. ")
+        _head = f"CPU is below target at max intensity ({pct:.0f}% < {target:.0f}%): "
+        _tail = f"{_hint}Raising the target further will not add useful work."
+        if _backoff > 1.0:
+            _rl_note = f"a rate limit was seen earlier (pace backoff x{_backoff:.1f})"
+            if _rl_recent:
+                _rl_note += ", most recently within the last 5 minutes"
+        elif _rl_recent:
+            _rl_note = "a rate-limit response was seen within the last 5 minutes (pace backoff has since decayed to 1.0)"
+        else:
+            _rl_note = "no 429 seen"
+        if _backoff > 1.0 and _recent_move:
+            return (_head + "the miner is being limited by the node's rate limits "
+                    f"(pace backoff x{_backoff:.1f} after rate-limit replies, "
+                    f"last move activity {time.time() - _last_move:.0f}s ago), "
+                    f"so there is only so much useful work to do. {_tail}")
+        if not getattr(self, "registered", False):
+            return (_head + "no useful work available -- waiting for registration / "
+                    f"maze_init from the node, not a rate limit ({_rl_note}). " + _tail)
+        if getattr(self, "maze", None) is None:
+            return (_head + "no useful work available -- waiting for maze state from "
+                    f"the node (registered, no maze yet), not a rate limit ({_rl_note}). " + _tail)
+        if getattr(self, "pow_pending", False):
+            return (_head + "no useful work available -- waiting on a wall-hit solve "
+                    f"(pow_pending), not a rate limit ({_rl_note}). " + _tail)
+        _nt = getattr(self, "nav_task", None)
+        if _nt is None or _nt.done():
+            return (_head + "no useful work available -- nav task not running while "
+                    f"round_active, not a rate limit ({_rl_note}). " + _tail)
+        if _rl_recent:
+            return (_head + "no useful work available right now; a rate-limit "
+                    "response was seen within the last 5 minutes, but with no "
+                    "recent move activity it is not the clear cause of the "
+                    "current idle moment. " + _tail)
+        return (_head + "no useful work available right now and no rate-limit "
+                "replies have been seen, so this is not evidence of throttling. " + _tail)
+
     async def _cpu_governor_loop(self):
         """CPU-TARGET-1: every 2s, measure process CPU% and nudge intensity
         toward the user target (deadband +-10%): below -> +0.10, above ->
@@ -2658,10 +2892,11 @@ class PCMiner:
                         "info", "sys0")
                     if inten >= 0.99 and pct < _t * 0.85 and not getattr(self, "_cpu_below_hinted", False):
                         self._cpu_below_hinted = True
-                        log(f"CPU is below target at max intensity ({pct:.0f}% < {_t:.0f}%): the miner is paced by the "
-                            f"node's rate limits, so there is only so much useful work to do. "
-                            f"{'' if isinstance(self.dqn, D3QNAgent) else 'Install numpy (pip install numpy) for multi-core D3QN training. '}"
-                            f"Raising the target further will not add useful work.", "info", "sys0")
+                        # R35 M4: the old text blamed the node's rate
+                        # limits on any idle moment; the governor has
+                        # no throttling input. Pick the text from
+                        # observed state (see _cpu_below_message).
+                        log(self._cpu_below_message(pct, _t), "info", "sys0")
             except (asyncio.CancelledError, GeneratorExit):
                 break
             except Exception:
@@ -2762,6 +2997,9 @@ class PCMiner:
     def _note_rate_limited(self):
         """AIMD decrease: a server 429 doubles the pacing backoff (capped).
         Throttled warning so a sustained limit doesn't spam the log."""
+        # TUNNEL-PARITY-2: stamp every observed 429, so the CPU governor
+        # can say whether a rate limit was actually seen (and when).
+        self._rate_limited_seen_at = time.time()
         try:
             self._pace_backoff = min(PACE_BACKOFF_MAX, float(self._pace_backoff) * 2.0)
         except (TypeError, ValueError):
@@ -3004,6 +3242,30 @@ class PCMiner:
         except Exception as e:
             log(f"{_c(RED, 'Navigate crashed')}: {e}", "error", "pog0")
 
+    async def _recovery_reconnect(self):
+        """R35 M2: reconnect + re-register after a persistent stall.
+
+        Runs on its own task, never on the nav task: connect() and
+        register() both call _stop_navigate(), which cancels the nav
+        task -- called inline from the nav loop that cancelled the
+        recovery itself (CancelledError is not an Exception, so it
+        sailed through every handler and _recovery_done was never
+        set). The nav loop schedules this and returns; by the time
+        it runs, the nav task is done, so the cancel is a no-op."""
+        try:
+            await self.connect()
+            if await self.register():
+                await self.request_state_sync()
+                log(f"Recovery: re-registered with node", "success", "net0")
+                self._recovery_done = True
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log(f"Recovery reconnect failed: {e}", "error", "net0")
+        finally:
+            if getattr(self, "_recovery_task", None) is asyncio.current_task():
+                self._recovery_task = None
+
     async def _navigate_loop(self):
         consecutive_timeouts = 0
         last_report_time = time.time()
@@ -3013,8 +3275,18 @@ class PCMiner:
                 break
 
             if self.pow_pending:
-                await asyncio.sleep(0.1)
-                continue
+                # R35 M1 (wedge guard): pow_pending must never spin
+                # forever. If it has been set longer than a move
+                # timeout + 5 s with no solve ack, clear it so the
+                # loop can attempt a move again.
+                _pow_age = time.time() - float(getattr(self, "_pow_pending_since", 0.0) or 0.0)
+                if _pow_age > MOVE_TIMEOUT + 5.0:
+                    log(f"pow_pending wedge guard -- clearing stale pow_pending (age {_pow_age:.1f}s > MOVE_TIMEOUT+5s)", "warning", "pog0")
+                    self.pow_pending = False
+                    self._pow_pending_since = 0.0
+                else:
+                    await asyncio.sleep(0.1)
+                    continue
 
             now = time.time()
 
@@ -3149,6 +3421,17 @@ class PCMiner:
             step = self.steps + 1
             dx, dy, dz = DIR_OFFSETS[dir_idx]
             next_pos = (self.current[0] + dx, self.current[1] + dy, self.current[2] + dz)
+            # R30: remember whether this move lands on the goal (a catch).
+            # Computed now, before the send, so a concurrent goal update
+            # cannot change it; the ack wait below uses the longer
+            # CATCH_MOVE_TIMEOUT for a catch only.
+            _is_catch_move = self.goal is not None and tuple(next_pos) == tuple(self.goal)
+            # R31: a ghost-catch move (stepping onto the ghost)
+            # also triggers a cold maze regeneration on the node
+            # (the restart), so it needs the same longer timeout
+            # as a goal catch. self.ghost is refreshed on every
+            # ack and is None at size <= 5.
+            _is_ghost_catch_move = self.ghost is not None and tuple(next_pos) == tuple(self.ghost)
 
             if not (0 <= next_pos[0] < self.size and 0 <= next_pos[1] < self.size and 0 <= next_pos[2] < self.size):
                 await self.request_state_sync()
@@ -3197,7 +3480,7 @@ class PCMiner:
                     self._pace_window.append(time.time())
                 except (AttributeError, TypeError):
                     pass
-                ack = await asyncio.wait_for(self.pending_ack, timeout=MOVE_TIMEOUT)
+                ack = await asyncio.wait_for(self.pending_ack, timeout=(CATCH_MOVE_TIMEOUT if (_is_catch_move or _is_ghost_catch_move) else MOVE_TIMEOUT))
                 self.last_ping = (time.time() - ping_start) * 1000
 
                 if ack.get("type") == "wall_hit":
@@ -3217,11 +3500,16 @@ class PCMiner:
                         self.current = tuple(ack["position"])
                     if ack.get("size") is not None:
                         self.size = safe_int(ack["size"], self.size)
-                    if ack.get("movenonce") is not None:
-                        self.movenonce = safe_int(ack["movenonce"], self.movenonce)
+                    # R28: do NOT adopt movenonce from a wall-hit reply.
+                    # A wall hit consumes no nonce, so the reply carries
+                    # the ATTEMPTED nonce; adopting it would put the miner
+                    # one nonce ahead of the DB, and the solve reply (which
+                    # stamps the DB nonce = sent_nonce - 1) would then be
+                    # rejected as stale. Keep the DB nonce instead.
                     if ack.get("growthcount") is not None:
                         self.growthcount = safe_int(ack["growthcount"], self.growthcount)
                     self.pow_pending = True
+                    self._pow_pending_since = time.time()
                     nonce = await self.solve_pow_async(seed, difficulty)
                     if nonce == -1:
                         self.pow_pending = False
@@ -3474,6 +3762,14 @@ class PCMiner:
 
             except asyncio.TimeoutError:
                 consecutive_timeouts += 1
+                # R35 M1: the solve/move ack wait timed out, so the
+                # solve is no longer pending. Clear pow_pending here
+                # (the generic handler below never runs for
+                # TimeoutError, which is caught first) or the loop
+                # top spins on pow_pending forever and no move is
+                # ever attempted again.
+                self.pow_pending = False
+                self._pow_pending_since = 0.0
                 if self.pending_ack and not self.pending_ack.done():
                     self.pending_ack.cancel()
                     self.pending_ack = None
@@ -3493,14 +3789,13 @@ class PCMiner:
                     self.registered = False
                     self.round_active = False
                     self.needs_reinit = True
-                    try:
-                        await self.connect()
-                        if await self.register():
-                            await self.request_state_sync()
-                            log(f"Recovery: re-registered with node", "success", "net0")
-                            self._recovery_done = True
-                    except Exception as e:
-                        log(f"Recovery reconnect failed: {e}", "error", "net0")
+                    # R35 M2: do NOT await connect()/register() here.
+                    # connect() calls _stop_navigate(), which cancels
+                    # this nav task itself, so the inline recovery
+                    # died with CancelledError before re-registering.
+                    # Run the reconnect on its own task and let this
+                    # nav loop return cleanly instead.
+                    self._recovery_task = asyncio.create_task(self._recovery_reconnect())
                     return
                 # POLISH-6: an elif consecutive_timeouts >= 3
                 # was here; it was unreachable — the if >= 3
@@ -3771,11 +4066,36 @@ class PCMiner:
                                     self.sealed_cells.add((x, y, z))
                 self._strip_seals()
             self._sync_event.set()
+            # R35 M3: a sync reply can restart movement -- if the nav
+            # task died, start navigate() (guarded against duplicates).
+            if self.round_active and self.maze and self.current != self.goal:
+                if self.nav_task is None or self.nav_task.done():
+                    log(f"Nav task died while round_active -- restarting navigate (maze_state)", "warning", "pog0")
+                    self.nav_task = asyncio.create_task(self.navigate())
 
         elif msg_type == "maze_move_ack":
-            if self.pending_ack and not self.pending_ack.done():
-                self.pending_ack.set_result(data)
+            # R24 (choke fix): a stale ack must not resolve the
+            # in-flight move wait. Only an ack with no movenonce,
+            # or one matching the nonce of the move just sent,
+            # releases pending_ack. State adoption below is unchanged.
+            _ack_nonce = data.get("movenonce")
+            if _ack_nonce is None or _ack_nonce == getattr(self, "sent_nonce", None):
+                if self.pending_ack and not self.pending_ack.done():
+                    self.pending_ack.set_result(data)
+            else:
+                log(f"Stale maze_move_ack ignored (movenonce={_ack_nonce}, sent_nonce={getattr(self, 'sent_nonce', None)})", "debug", "pog0")
             if data.get("success"):
+                # R30: adopt movenonce monotonically from any maze_move_ack,
+                # even a late one whose pending_ack is already cancelled
+                # (the move timed out but the node accepted it). The ack's
+                # movenonce is a DB nonce the node stamped, so max() can
+                # never overshoot the DB. Without this the miner resends
+                # the timed-out nonce and gets a -1 desync rejection.
+                if data.get("movenonce") is not None:
+                    try:
+                        self.movenonce = max(self.movenonce, safe_int(data["movenonce"], self.movenonce))
+                    except Exception:
+                        pass
                 st = data.get("state", {}) or {}
                 is_transition = st.get("caught") or st.get("shrink")
                 if not is_transition:
@@ -3808,11 +4128,34 @@ class PCMiner:
                     if data.get("goal"):
                         self.goal = tuple(data["goal"])
                     if data.get("movenonce") is not None:
-                        self.movenonce = safe_int(data["movenonce"], self.movenonce)
+                        # R30: monotonic (see the adoption above) — a stale
+                        # shrink ack must not move the nonce backwards.
+                        self.movenonce = max(self.movenonce, safe_int(data["movenonce"], self.movenonce))
 
         elif msg_type == "wall_hit" or msg_type == "wall_hit_solved":
-            if self.pending_ack and not self.pending_ack.done():
-                self.pending_ack.set_result(data)
+            # R24: same stale-ack guard as maze_move_ack above.
+            # R28: also accept sent_nonce - 1 -- a wall-hit reply carries
+            # the attempted nonce and the solve reply stamps the DB nonce,
+            # which is one behind the last sent move nonce (a wall hit
+            # consumes no nonce).
+            _ack_nonce = data.get("movenonce")
+            _sent = getattr(self, "sent_nonce", None)
+            if _ack_nonce is None or _ack_nonce == _sent or (_sent is not None and _ack_nonce == _sent - 1):
+                if self.pending_ack and not self.pending_ack.done():
+                    self.pending_ack.set_result(data)
+            else:
+                log(f"Stale {msg_type} ignored (movenonce={_ack_nonce}, sent_nonce={getattr(self, 'sent_nonce', None)})", "debug", "pog0")
+            # R30: adopt movenonce monotonically from a wall_hit_solved
+            # reply (its movenonce is the DB nonce the node stamped),
+            # even if the pending_ack is already cancelled. NOT from a
+            # plain wall_hit reply — that carries the ATTEMPTED nonce,
+            # one ahead of the DB, and adopting it would put the miner
+            # one ahead.
+            if msg_type == "wall_hit_solved" and data.get("movenonce") is not None:
+                try:
+                    self.movenonce = max(self.movenonce, safe_int(data["movenonce"], self.movenonce))
+                except Exception:
+                    pass
 
         elif msg_type == "balance":
             old = self.balance
@@ -3985,11 +4328,16 @@ class PCMiner:
                         await self.disconnect()
                 if self.round_active and self.maze and self.current != self.goal:
                     if self.nav_task is None or self.nav_task.done():
-                        log(f"Nav task died while round_active — requesting state sync", "warning", "pog0")
+                        # R35 M3: a dead nav task is never restarted by
+                        # a state sync alone -- restart navigate() here
+                        # (guarded: only when no nav task is running).
+                        log(f"Nav task died while round_active -- restarting navigate", "warning", "pog0")
                         try:
                             await self.request_state_sync()
                         except Exception:
                             pass
+                        if self.nav_task is None or self.nav_task.done():
+                            self.nav_task = asyncio.create_task(self.navigate())
 
     async def _start_pool(self):
         """Spawn + warm the worker processes in the background (PoW uses the
@@ -4023,7 +4371,8 @@ class PCMiner:
 
         while self.running:
             if not self.node_url:
-                nodes = await discover_nodes(load_settings())
+                nodes = await discover_nodes(load_settings(), force_refresh=self._discovery_force_refresh)
+                self._discovery_force_refresh = False
                 if not nodes:
                     log("No node candidates available, retrying...", "warning", "net0")
                     await asyncio.sleep(10)
@@ -4054,6 +4403,7 @@ class PCMiner:
                     finally:
                         if self.ws is active_ws:
                             await self.disconnect()
+                            self._session_dropped = True
                             self.registered = False
                             self.round_active = False
                             self.pow_pending = False
@@ -4069,12 +4419,33 @@ class PCMiner:
                     await asyncio.sleep(self._reconnect_delay())
                     continue
 
+            # TUNNEL-PARITY-1: a dropped live session re-consults the
+            # registry before reconnecting (TTL cache: fresh fetch when
+            # stale). The node just dropped stays first (same-node resume);
+            # the refreshed deque holds the other candidates.
+            if self.node_url and getattr(self, "_session_dropped", False):
+                self._session_dropped = False
+                _fresh = await discover_nodes(load_settings())
+                if _fresh:
+                    _cur = self.node_url
+                    self._node_candidates = deque([u for u in _fresh if u != _cur])
+
             if not await self.connect(self.node_url):
                 _record_peer_fail(self.node_url)
                 self.reconn_attempts += 1
                 if self.reconn_attempts > MAX_RECONNECT:
                     log(f"Giving up on {self.node_url}, trying next...", "warning", "net0")
+                    # TUNNEL-PARITY-1: re-consult the registry before
+                    # moving on (TTL cache), and do not re-queue the node
+                    # that just failed MAX_RECONNECT times.
+                    _failed_url = self.node_url
+                    _fresh = await discover_nodes(load_settings())
+                    _fresh = [u for u in _fresh if u != _failed_url]
+                    if _fresh:
+                        self._node_candidates = deque(_fresh)
                     self.node_url = self._node_candidates.popleft() if self._node_candidates else None
+                    if self.node_url is None:
+                        self._discovery_force_refresh = True
                     self.reconn_attempts = 0
                 await asyncio.sleep(self._reconnect_delay())
                 continue
@@ -4100,6 +4471,7 @@ class PCMiner:
                 finally:
                     if self.ws is active_ws:
                         await self.disconnect()
+                        self._session_dropped = True
                         self.registered = False
                         self.round_active = False
                         self.pow_pending = False
@@ -4116,6 +4488,23 @@ class PCMiner:
                         log("Old connection closed but recovery active, keeping new connection", "info", "net0")
             else:
                 log("Registration failed, retrying...", "warning", "net0")
+                # TUNNEL-PARITY-1: a node that accepts TCP but never
+                # registers used to pin the miner forever (no attempt
+                # counting here). Count it like a connect failure and,
+                # past MAX_RECONNECT, re-consult the registry and move on.
+                _record_peer_fail(self.node_url)
+                self.reconn_attempts += 1
+                if self.reconn_attempts > MAX_RECONNECT:
+                    log(f"Giving up on {self.node_url} after {self.reconn_attempts} failed registrations, trying next candidate...", "warning", "net0")
+                    _failed_url = self.node_url
+                    _fresh = await discover_nodes(load_settings())
+                    _fresh = [u for u in _fresh if u != _failed_url]
+                    if _fresh:
+                        self._node_candidates = deque(_fresh)
+                    self.node_url = self._node_candidates.popleft() if self._node_candidates else None
+                    if self.node_url is None:
+                        self._discovery_force_refresh = True
+                    self.reconn_attempts = 0
                 await asyncio.sleep(self._reconnect_delay())
             await asyncio.sleep(self._reconnect_delay())
 
@@ -4167,6 +4556,11 @@ async def main():
     settings = load_settings()
     if args.registry_url:
         settings["registry_url"] = args.registry_url
+        # TUNNEL-PARITY-1: persist the override at once. run() re-reads
+        # settings from disk on every discovery, so without this save a
+        # --registry-url given without --cpu (or any other settings save)
+        # was silently dropped and the default registry was used instead.
+        save_settings(settings)
     first_run = not settings.get("wallet")
 
     # CPU-TARGET-1: resolve target precedence CLI > prompt > settings > 50.
@@ -4278,24 +4672,25 @@ async def main():
         settings["privkey"] = args.privkey
 
     _, _, maze_keys, pqc_pub, pqc_priv = load_wallet_full()
-    # SINGLE-KEY MODE: the node requires BOTH of these at once —
-    #   register: miner_id must derive from the identity key
-    #             (R5-register-pc-derivation), and
-    #   verify:   the sealed winner must derive from the attestation
-    #             (maze) key (IDEA5-MAZE-KEY-BINDING-1).
-    # With distinct identity/maze keys no single miner_id satisfies both,
-    # so every separate-maze-key registration is rejected with "miner_id
-    # does not derive from pub_key". Use the identity keypair for
-    # maze/block operations too — the same single-key mode the embedded
-    # miner uses (maze_id == identity pubkey). Wallet/balance are
-    # unaffected (identity key unchanged); maze progress tracked under a
-    # previous separate maze key restarts under the identity key.
+    # R24: the node now derives the expected miner_id from
+    # block_signing_pub (the maze key) instead of the identity
+    # pub_key, while still verifying the register signature
+    # against the identity pub_key. Honour a stored maze key:
+    # the first stored key owns this miner's maze (and, via
+    # PCMiner.__init__, its stable miner_id), so a second miner
+    # on a shared wallet mines under its own distinct maze key
+    # instead of the identity key - the R14-remap seal bug
+    # (producer_pub != attestation pubkey) is gone. With no
+    # stored maze key, fall back to the identity keypair as
+    # before (the first miner on a wallet).
     if maze_keys:
-        log(f"{_c(YLW, 'Separate maze key(s) ignored:')} single-key mode uses the identity key "
-            f"for maze/block operations (node requires identity-derived miner_id). "
-            f"Maze progress restarts under {_c(CYN, args.wallet)}.", "warning", "sys0")
-    mp = args.privkey
-    mz = _pubkey_from_privkey(args.privkey)
+        log(f"{_c(YLW, 'Stored maze key(s) found:')} using the first stored maze key "
+            f"for maze/block operations (distinct maze key per miner on a shared wallet). "
+            f"Maze progress stays under {_c(CYN, args.wallet)}.", "warning", "sys0")
+        mp, mz = maze_keys[0]["priv"], maze_keys[0]["pub"]
+    else:
+        mp = args.privkey
+        mz = _pubkey_from_privkey(args.privkey)
     if not pqc_pub or not pqc_priv:
         if PQC_AVAILABLE:
             pqc_pub, pqc_priv = pqc_keygen()
@@ -4309,8 +4704,9 @@ async def main():
         else:
             pqc_pub, pqc_priv = b"", b""
 
-    # mp/mz already single-key (identity); do NOT call choose_maze_key —
-    # any separate maze key breaks registration (see above).
+    # mp/mz are already chosen above (first stored maze key, else
+    # the identity keypair). Do NOT call choose_maze_key here - it
+    # prompts, which would stall a headless start.
 
     model_format = settings.get("model_format", "json")
     core_suffix = settings.get("core_suffix", "genius")
@@ -4326,6 +4722,7 @@ async def main():
                     core_suffix=core_suffix, mazepriv=mp, mazepub=mz,
                     pqc_pub=pqc_pub, pqc_priv=pqc_priv, model_format=model_format,
                     cpu_percent=cpu_percent, proc_workers=args.procs)
+    miner._maze_keys = maze_keys
     print(BANNER)
     try:
         await miner.run()
