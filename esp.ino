@@ -1,3 +1,41 @@
+// ======= FIXED BUILD — esp_nolib_fixed.ino =======
+// Base: esp_nolib.ino sha256 8d28487052b3c2ed342d3f0cfa96c8a54f9b6c8277724674bf159ea58a6c28ae
+// Fixes (2026-11-26, miner-side only; maze algorithm, signing, move-auth
+// canonical JSON, memory challenge, PoW and block signing unchanged):
+//  1. Maze parse: any message carrying a "maze" array now uses a streaming
+//     parser (streamParseMaze) writing 1 byte per cell straight into a
+//     malloc'd buffer, and the generic JSON arena only ever sees the
+//     message with the maze array redacted to []. A dim-16 maze is ~25 KiB
+//     JSON / 4 KiB cells instead of a ~638 KiB arena. Oversize mazes
+//     (dim > MAX_MAZE_DIM) still redact so the size field reaches the
+//     oversize wait path.
+//  2. Registry: wss:// (tunnel) entries are skipped (no TLS WS client);
+//     re-pick walks the usable registry entries, then MCX_NODE_HOST —
+//     never a once-only dead-end (fetchRegistryNodeIdx, wsWatchdog repick).
+//  3. NTP no longer gates registration: on WS connect the miner registers
+//     anyway; a wrong clock is rejected by the node (registration_failed).
+//  4. Maze-state timeout 10 s -> 120 s (node cold generation up to 120 s);
+//     no duplicate get_maze_state while one is outstanding.
+//  5. wall_hit no longer adopts movenonce (it carries the ATTEMPTED nonce).
+//  6. Ghost cell is read from maze_init/maze_state/maze_move_ack/wall_hit/
+//     wall_hit_solved and treated as blocked in BFS (isGhostCell).
+//  7. NOT FIXED: produce_block / 96 KiB cap — see note at MCX_MAX_JSON_BYTES.
+//  8. setup() logs esp_reset_reason() at every boot (brownout diagnosis).
+//  9. Sealed-in stall (harness run-1 root cause, verified by reconstructing
+//     the dim-11 maze from the node seed): the node sealed cell (5,3,4) —
+//     the first step of the base maze's ONLY route from (5,3,3) to (1,4,7)
+//     — after checking the path on the mutate_maze_walls-mutated maze
+//     (nonce 109), not the base maze the miner plans on. The authoritative
+//     maze then had no path and no resync could fix it. Miner-side fix:
+//     track reported-sealed cells separately (gSealed), retry BFS ignoring
+//     sealed cells (the node validates moves against the base maze only —
+//     SEAL-1, as the PC miner does), retry ignoring the ghost cell, and
+//     back off: no-path resyncs are rate-limited, never clobber the
+//     backoff, and a genuinely pathless maze slow-polls instead of
+//     reconnect-spinning. The node-side fix (seal check must use the base
+//     maze) is NOT in this file — see report. Also: opened_walls no longer
+//     opens base walls in the local copy (the node never opens them).
+// ==================================================
 // ======= Config for user — FILL THESE IN before flashing =======
 // WiFi: your network name and password. The ESP32 only does 2.4 GHz — a
 // 5 GHz network will NEVER connect. If your router merges both bands under
@@ -45,10 +83,13 @@
 #define WIFI_MAX_BACKOFF_MS           60000
 #define WS_RECONNECT_MIN_MS           3000
 #define WS_RECONNECT_MAX_MS           60000
+#define WS_REPICK_AFTER_MS              60000  // never-connected pick -> try next node
 #define WS_SILENCE_TIMEOUT_MS         120000
 #define REGISTER_TIMEOUT_MS           35000
 #define MOVE_ACK_TIMEOUT_MS           12000
-#define MAZE_STATE_TIMEOUT_MS         10000
+#define MAZE_STATE_TIMEOUT_MS         120000  // node cold maze gen takes up to 120 s
+#define RESYNC_MIN_INTERVAL_MS          2000   // at most one get_maze_state per 2 s (hammer guard)
+#define NO_PATH_SLOW_POLL_MS            30000  // genuinely pathless maze: poll state every 30 s
 #define POW_ACK_TIMEOUT_MS            12000
 #define POW_MAX_SOLVE_MS              45000
 #define MAZE_WAIT_TIMEOUT_MS          90000
@@ -89,6 +130,7 @@ struct MjKV;
 struct Arena;
 struct MjParser;
 struct OutBuf;
+struct MazeStream;
 enum MjType : uint8_t;
 struct Cfg;
 struct QT;
@@ -134,6 +176,15 @@ class WebSocketsClient;
 // ESP-IDF (WiFiClient, mbedTLS). Nothing to download.
 // Application-side JSON cap (receive limit enforced by the in-file WS client).
 #define MCX_MAX_JSON_BYTES (96u * 1024u)
+// NOTE (produce_block cap, measured, deliberately NOT raised): the block's
+// maze_state carries only small per-maze facts (maze_id/minerid/seed/goal
+// coords — node.py _build_maze_state), never the maze grid, so block size
+// scales with tx count / attestation, not maze dim. Raising the cap is
+// unsafe: handleProduceBlock() mallocs len*6+32768 for its arena, so a
+// 96 KiB frame already needs ~618 KiB — past the ESP32 heap. Frames above
+// the cap are rejected and logged; signing bigger blocks would need a
+// streaming canonical hash, which is out of scope for this fix.
+
 // In-file WebSockets client frame cap (see the shim below). Frames above
 // MCX_MAX_JSON_BYTES are rejected by handleMessage anyway.
 #define WEBSOCKETS_MAX_DATA_SIZE (256u * 1024u)
@@ -2586,8 +2637,13 @@ static uint32_t gRegisterSentMs = 0;
 static bool     gWsBegun = false;   // begin() called exactly once (see wsEnsureBegun)
 static char     gNodeHost[64] = ""; // active node host: registry pick, else MCX_NODE_HOST
 static uint16_t gNodePort = 0;      // active node port
-static bool     gRegistryTried = false;
 static uint8_t  gRegFailStreak = 0;
+static uint8_t  gRegistryIdx = 0;       // registry candidate currently in use
+static bool     gRegistryExhausted = false; // no (further) usable registry entry
+static bool     gOnConfigFallback = false;  // active node is MCX_NODE_HOST
+static bool     gConnectedSinceBegin = false; // any CONNECTED since last begin()
+static uint32_t gWsBeginMs = 0;         // millis() of the current begin()
+static uint32_t gLastRepickMs = 0;      // millis() of the last re-pick
 static bool     gNtpOk = false;
 static bool     gNtpDead = false;   // NTP unreachable: proceed without time sync (see ntpWatchdog)
 static uint32_t gNtpWaitStartMs = 0;
@@ -2597,17 +2653,41 @@ static uint32_t gLastPingMs = 0;      // last uptime_ping sent
 
 static int      gAwait = AWAIT_NONE;
 static uint32_t gAwaitStartMs = 0;
+static uint32_t gLastResyncMs = 0;  // last get_maze_state sent (hammer guard)
 static uint8_t  gAwaitFails = 0;
 
 // maze
 static uint8_t* gCells = NULL;
 static int      gCellsCap = 0;
+static uint8_t* gSealed = NULL;  // 1 byte/cell: reported-sealed (tracked separately from walls)
 static int      gDim = 0;
 static int8_t   gCur[3]  = { 0, 0, 0 };
 static int8_t   gGoal[3] = { 0, 0, 0 };
 static int64_t  gNonce = 0;       // last ACCEPTED move nonce
 static int64_t  gGrowth = 0;
 static bool     gHasMaze = false;
+static int8_t   gGhost[3] = { 0, 0, 0 }; // latest ghost cell from the node
+static bool     gHasGhost = false;      // ghost known (size > 5 only)
+static bool     gBfsIgnoreSealed = false; // current BFS may cross reported-sealed cells
+static bool     gBfsIgnoreGhost = false;  // current BFS may cross the ghost cell
+// Streamed maze (fix 1): a message's "maze" array is parsed by the
+// streaming parser straight into a 1-byte-per-cell buffer instead of the
+// generic JSON arena. adoptMazeArr() consumes it; clearStreamedMaze()
+// drops it (called at the end of every handleMessage, so it never leaks
+// into the next message).
+static uint8_t* gStreamCells = NULL;
+static int      gStreamDim = 0;
+static bool     gStreamValid = false;
+
+static void clearStreamedMaze() {
+  if (gStreamCells) { free(gStreamCells); gStreamCells = NULL; }
+  gStreamDim = 0;
+  gStreamValid = false;
+}
+
+static void clearSealedSet() {
+  if (gSealed && gCellsCap > 0) memset(gSealed, 0, (size_t)gCellsCap);
+}
 
 // BFS scratch
 static uint8_t* gVis = NULL;
@@ -2786,7 +2866,14 @@ static bool ensureMazeCap(int cells) {
   if (cells <= gCellsCap) return true;
   uint8_t* nc = (uint8_t*)realloc(gCells, (size_t)cells);
   if (!nc) return false;
-  gCells = nc; gCellsCap = cells;
+  gCells = nc;
+  uint8_t* ns = (uint8_t*)realloc(gSealed, (size_t)cells);
+  if (!ns) return false;
+  // Zero only the newly added region; the tracked sealed set for the
+  // cells that already existed survives a growth.
+  if (cells > gCellsCap) memset(ns + gCellsCap, 0, (size_t)(cells - gCellsCap));
+  gSealed = ns;
+  gCellsCap = cells;
   return true;
 }
 
@@ -2811,8 +2898,41 @@ static inline bool inBounds(int x, int y, int z) {
   return x >= 0 && y >= 0 && z >= 0 && x < gDim && y < gDim && z < gDim;
 }
 
+// Reported-sealed cells are tracked separately from base walls (gSealed):
+// the node bakes them into the maze arrays it sends, but validates moves
+// against the base maze only (SEAL-1 — the PC miner probes and learns the
+// same). BFS treats them as walls normally, and as open only in the
+// sealed-in fallback (miningTick) — crossing one is how a sealed-in miner
+// recovers instead of stalling forever.
+static inline bool isSealedCell(int x, int y, int z) {
+  return gSealed != NULL && inBounds(x, y, z) && gSealed[cellIdx(x, y, z)] != 0;
+}
+
+static inline void clearBfsModes() {
+  gBfsIgnoreGhost = false;
+  gBfsIgnoreSealed = false;
+}
+
+// Ghost cell from the node: the ghost chases the miner, so BFS must route
+// around it instead of through it. Never block the miner's own cell or the
+// goal cell: a stale ghost report (or the ghost standing on us / on the
+// goal) must not make BFS report "no path" from where we already stand
+// or to where we must go.
+static inline bool isGhostCell(int x, int y, int z) {
+  if (!gHasGhost || gBfsIgnoreGhost) return false;
+  if (x != gGhost[0] || y != gGhost[1] || z != gGhost[2]) return false;
+  if (x == gCur[0] && y == gCur[1] && z == gCur[2]) return false;
+  if (x == gGoal[0] && y == gGoal[1] && z == gGoal[2]) return false;
+  return true;
+}
+
 static inline bool isOpen(int x, int y, int z) {
-  return inBounds(x, y, z) && gCells[cellIdx(x, y, z)] == 0;
+  if (!inBounds(x, y, z)) return false;
+  if (gCells[cellIdx(x, y, z)] == 0) return !isGhostCell(x, y, z);
+  // Reported-sealed cell: a wall in the local copy, but crossable as a
+  // last resort (fallback BFS only) — the node accepts the move.
+  if (gBfsIgnoreSealed && isSealedCell(x, y, z)) return !isGhostCell(x, y, z);
+  return false;
 }
 
 // BFS from s to g. Returns: 1 = first step found (out = next cell),
@@ -3296,6 +3416,7 @@ static bool sendMove(int dirIdx) {
 }
 
 static void sendGetMazeState() {
+  if (gAwait == AWAIT_MAZE_STATE) return;  // one outstanding request only
   char out[384];
   int n = snprintf(out, sizeof(out),
       "{\"type\":\"get_maze_state\",\"miner_id\":\"%s\",\"maze_id\":\"%s\"}",
@@ -3307,6 +3428,11 @@ static void sendGetMazeState() {
 
 static void requestResync(const char* why) {
   if (gAwait == AWAIT_MAZE_STATE) return;
+  // Hammer guard (run-1 bug #9: resyncs 2-7 ms apart tripped the node's
+  // rate limiter): at most one get_maze_state per RESYNC_MIN_INTERVAL_MS.
+  uint32_t now = millis();
+  if (gLastResyncMs != 0 && (now - gLastResyncMs) < RESYNC_MIN_INTERVAL_MS) return;
+  gLastResyncMs = now;
   logf_("SYNC", "resync: %s", why);
   gAwait = AWAIT_NONE;
   sendGetMazeState();
@@ -3338,6 +3464,8 @@ static void doReconnect(const char* why) {
   gWsUp = false;
   gRegistered = false;
   gHasMaze = false;
+  gHasGhost = false;
+  clearSealedSet();
   gAwait = AWAIT_NONE;
   gChalPending = false;
   if (gChalOuterInit) { mbedtls_sha256_free(&gChalOuter); gChalOuterInit = false; }
@@ -3349,15 +3477,18 @@ static void doReconnect(const char* why) {
   webSocket.disconnect();
 }
 
-// Registry reader: one HTTPS GET of the node list. The list is public
-// data and the miner's key never leaves the board on this link; the
-// node's own WebSocket link is plain ws:// today, so this fetch is
-// not the weak link. TLS runs without a bundled root (setInsecure):
-// the sketch ships no CA bundle to download, and a bad or hostile
-// list fails the JSON parse below and falls back to the configured
-// node. Bounded by the HTTPClient timeout (5 s).
-static bool fetchRegistryNode() {
+// Registry reader: one HTTPS GET of the node list, returning the idx-th
+// usable PLAIN-ws:// node (0-based). The ESP has no TLS WebSocket client,
+// so wss:// (tunnel) entries are skipped, never dialled: dialling plain
+// TCP at a tunnel host would refuse/time out forever. A bad or hostile
+// list fails the JSON parse below and returns false, so the caller falls
+// back to the configured node. The list is public data and the miner's
+// key never leaves the board on this link. TLS runs without a bundled
+// root (setInsecure): the sketch ships no CA bundle to download.
+// Bounded by the HTTPClient timeout (5 s).
+static bool fetchRegistryNodeIdx(uint8_t idx) {
 #if !MCX_REGISTRY_ENABLED
+  (void)idx;
   return false;
 #else
   WiFiClientSecure tls;
@@ -3374,52 +3505,57 @@ static bool fetchRegistryNode() {
   if (deserializeJson(doc, body.c_str(), body.length())) return false;
   JsonArrayConst nodes = doc["nodes"].as<JsonArrayConst>();
   if (nodes.isNull() || nodes.size() == 0) return false;
-  JsonVariantConst first = nodes[0];
-  const char* wsUrl = first["ws_url"] | "";
-  if (*wsUrl) {
-    const char* h = strstr(wsUrl, "://");
-    if (!h) return false;
-    h += 3;
-    const char* slash = strchr(h, '/');
-    size_t hostLen = slash ? (size_t)(slash - h) : strlen(h);
-    const char* colon = (const char*)memchr(h, ':', hostLen);
-    uint16_t port = MCX_NODE_PORT;
-    if (colon) {
-      port = (uint16_t)atoi(colon + 1);
-      hostLen = (size_t)(colon - h);
+  uint8_t usable = 0;
+  for (size_t ni = 0; ni < nodes.size(); ni++) {
+    JsonVariantConst entry = nodes[ni];
+    char host[64];
+    uint16_t port = 0;
+    const char* wsUrl = entry["ws_url"] | "";
+    if (*wsUrl) {
+      // Tunnel entries are wss:// — the ESP cannot do TLS WebSockets.
+      if (strncmp(wsUrl, "ws://", 5) != 0) continue;
+      const char* h = wsUrl + 5;
+      const char* slash = strchr(h, '/');
+      size_t hostLen = slash ? (size_t)(slash - h) : strlen(h);
+      const char* colon = (const char*)memchr(h, ':', hostLen);
+      port = MCX_NODE_PORT;
+      if (colon) {
+        port = (uint16_t)atoi(colon + 1);
+        hostLen = (size_t)(colon - h);
+      }
+      if (hostLen == 0 || hostLen >= sizeof(host) || port == 0) continue;
+      memcpy(host, h, hostLen);
+      host[hostLen] = '\0';
+    } else {
+      const char* ip = entry["ip"] | "";
+      int portNum = entry["ws_port"] | 0;
+      if (!*ip || portNum <= 0 || portNum > 65535) continue;
+      strncpy(host, ip, sizeof(host) - 1);
+      host[sizeof(host) - 1] = '\0';
+      port = (uint16_t)portNum;
     }
-    if (hostLen == 0 || hostLen >= sizeof(gNodeHost) || port == 0) return false;
-    memcpy(gNodeHost, h, hostLen);
-    gNodeHost[hostLen] = '\0';
-    gNodePort = port;
-  } else {
-    const char* ip = first["ip"] | "";
-    int port = first["ws_port"] | 0;
-    if (!*ip || port <= 0 || port > 65535) return false;
-    strncpy(gNodeHost, ip, sizeof(gNodeHost) - 1);
+    if (usable < idx) { usable++; continue; }
+    strncpy(gNodeHost, host, sizeof(gNodeHost) - 1);
     gNodeHost[sizeof(gNodeHost) - 1] = '\0';
-    gNodePort = (uint16_t)port;
+    gNodePort = port;
+    logf_("WS", "registry node #%d %s:%d", (int)idx, gNodeHost, (int)gNodePort);
+    return true;
   }
-  logf_("WS", "registry node %s:%d", gNodeHost, (int)gNodePort);
-  return true;
+  return false;
 #endif
 }
 
-// Called when WiFi is up. Runs begin() at most once for the whole uptime:
-// the NTP gate must NOT delay it (NTP only gates REGISTER, not TCP), so a
-// dead NTP path can never leave the client permanently uninitialized.
-static void wsEnsureBegun() {
-  if (gWsBegun) return;
-  if (WiFi.status() != WL_CONNECTED) return;
-  if (!gRegistryTried) {
-    gRegistryTried = true;
-    if (!fetchRegistryNode()) {
-      strncpy(gNodeHost, MCX_NODE_HOST, sizeof(gNodeHost) - 1);
-      gNodeHost[sizeof(gNodeHost) - 1] = '\0';
-      gNodePort = MCX_NODE_PORT;
-      logf_("WS", "registry unavailable, using configured node %s:%d", gNodeHost, (int)gNodePort);
-    }
-  }
+static void pickConfiguredNode() {
+  strncpy(gNodeHost, MCX_NODE_HOST, sizeof(gNodeHost) - 1);
+  gNodeHost[sizeof(gNodeHost) - 1] = '\0';
+  gNodePort = MCX_NODE_PORT;
+}
+
+// (Re-)begin the WS client on the current gNodeHost/gNodePort. Called once
+// per pick, never in a tight loop: begin() re-arms the library's reconnect
+// timer, so re-picks are rate-limited to one per WS_REPICK_AFTER_MS (see
+// wsWatchdog) and never happen for a pick that has ever connected.
+static void wsBeginCurrent() {
   IPAddress ip;
   if (WiFi.hostByName(gNodeHost, ip)) {
     logf_("WS", "begin %s:%d/ws (resolved %s)", gNodeHost, (int)gNodePort,
@@ -3430,7 +3566,29 @@ static void wsEnsureBegun() {
   }
   webSocket.begin(gNodeHost, gNodePort, "/ws");
   gWsBegun = true;
+  gWsBeginMs = millis();
+  gConnectedSinceBegin = false;
   if (gPhase != PH_CHALLENGE) gPhase = PH_REGISTER;
+}
+
+// Called when WiFi is up. Picks the first usable registry node (registry
+// first, per Xaver's order) and begins the client once. A pick that never
+// connects is re-picked by wsWatchdog (next registry entry, then the
+// configured node); a pick that connected at least once is left to the
+// library's own redial. NTP must NOT delay this: it never gated the TCP
+// client, and it no longer gates REGISTER either — a dead NTP path can
+// never leave the client permanently uninitialized.
+static void wsEnsureBegun() {
+  if (gWsBegun) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+  gRegistryIdx = 0;
+  if (!fetchRegistryNodeIdx(0)) {
+    pickConfiguredNode();
+    gOnConfigFallback = true;
+    gRegistryExhausted = true;
+    logf_("WS", "registry unavailable, using configured node %s:%d", gNodeHost, (int)gNodePort);
+  }
+  wsBeginCurrent();
 }
 // ======= BLOCK SIGNING =======
 // Matches _embedded_sign_block(): inject producer_pub FIRST, hash = sha256 of
@@ -3539,6 +3697,35 @@ static bool readMazeCellBit(JsonVariantConst cell, uint8_t* outBit) {
   return false;
 }
 
+// Ghost: the node sends "ghost":[x,y,z] (or null) on maze_init,
+// maze_move_ack, wall_hit and wall_hit_solved, and state["ghost"] on
+// maze_state (node.py: _ghost_tuple). Mirror the PC miner: only trust it
+// when the maze is bigger than 5 (no ghost exists at size <= 5).
+static bool readGhostCoord(JsonVariantConst v, int size, int8_t out[3]) {
+  if (size <= 5 || size > MAX_MAZE_DIM) return false;
+  JsonArrayConst a = v.as<JsonArrayConst>();
+  if (a.isNull() || a.size() < 3) return false;
+  int tmp[3];
+  for (int i = 0; i < 3; ++i) {
+    JsonVariantConst c = a[i];
+    if (!c.is<int>()) return false;
+    tmp[i] = c.as<int>();
+    if (tmp[i] < 0 || tmp[i] >= size) return false;
+  }
+  for (int i = 0; i < 3; ++i) out[i] = (int8_t)tmp[i];
+  return true;
+}
+
+static void setGhostFrom(JsonVariantConst v, int size) {
+  int8_t g[3];
+  if (readGhostCoord(v, size, g)) {
+    memcpy(gGhost, g, sizeof(gGhost));
+    gHasGhost = true;
+  } else {
+    gHasGhost = false;
+  }
+}
+
 static bool adoptMazeArr(JsonVariantConst arr, int size) {
   // Validate before multiplying; a malformed peer-supplied size must not cause
   // signed overflow in size*size*size before the bounds check.
@@ -3550,6 +3737,27 @@ static bool adoptMazeArr(JsonVariantConst arr, int size) {
     gMazeTooBig = (size > MAX_MAZE_DIM);
     logf_("MAZE", "bad size %d (max %d)", size, MAX_MAZE_DIM);
     return false;
+  }
+  if (gStreamValid) {
+    // Streaming path (handleMessage): the maze array was already parsed
+    // straight into gStreamCells; the redacted document's "maze" is [].
+    if (gStreamDim != size) {
+      logf_("MAZE", "streamed maze dim=%d != size field %d", gStreamDim, size);
+      clearStreamedMaze();
+      return false;
+    }
+    const int streamCells = gStreamDim * gStreamDim * gStreamDim;
+    if (!ensureMazeCap(streamCells) || !ensureBfsCap(streamCells)) {
+      logf_("MAZE", "alloc failed for %d cells (heap %u)", streamCells,
+            (unsigned)ESP.getFreeHeap());
+      clearStreamedMaze();
+      return false;
+    }
+    gMazeTooBig = false;
+    gDim = gStreamDim;
+    memcpy(gCells, gStreamCells, (size_t)streamCells);
+    clearStreamedMaze();
+    return true;
   }
   const int cells = size * size * size; // size is now bounded by MAX_MAZE_DIM
   if (arr.isNull()) {
@@ -3619,6 +3827,7 @@ static bool readMazeCoord(JsonArrayConst a, int size, int8_t out[3]) {
 // Stable wait state for an oversized chain maze; reconnecting cannot fix the cap.
 static void waitForSupportedMaze(const char* source) {
   gHasMaze = false;
+  gHasGhost = false;
   gAwait = AWAIT_NONE;
   gPhase = PH_WAIT_MAZE;
   gMazeTooBig = true;
@@ -3645,10 +3854,31 @@ static void applyWallList(JsonVariantConst arr, uint8_t val, const char* what) {
     if (!w[0].is<int>() || !w[1].is<int>() || !w[2].is<int>()) continue;
     int x = w[0].as<int>(), y = w[1].as<int>(), z = w[2].as<int>();
     if (!inBounds(x, y, z)) continue;
-    gCells[cellIdx(x, y, z)] = val;
+    int ci = cellIdx(x, y, z);
+    if (val == 1) {
+      gCells[ci] = 1;
+      if (gSealed) gSealed[ci] = 1;
+    } else {
+      // "opened": the node only ever reports base walls here — its move
+      // validation maze never opens them (it only discards them from the
+      // sealed set, which they were never in). Opening gCells would plan
+      // routes through a wall the node rejects with wall_hit. So only
+      // clear the sealed mark; open the cell itself only if it was
+      // genuinely sealed (defensive: a truly un-sealed cell is open in
+      // the base maze).
+      if (gSealed && gSealed[ci]) { gSealed[ci] = 0; gCells[ci] = 0; }
+    }
     n++;
   }
   if (n) logf_("MAZE", "%s %d cells", what, n);
+}
+
+// Replace the tracked sealed set with the node's authoritative full set
+// (move-ack / wall_hit_solved top-level sealed_walls). The maze array
+// already carries these as walls; only the separate bitset is rebuilt.
+static void applySealedSetFull(JsonVariantConst arr) {
+  clearSealedSet();
+  applyWallList(arr, 1, "sealed");
 }
 
 static void resetRoundState(bool newMaze) {
@@ -3677,7 +3907,9 @@ static void handleMazeInit(JsonDocument& doc) {
   }
   // The node also bakes sealed walls into the maze array; applying the
   // list again is idempotent belt-and-braces.
+  clearSealedSet();  // new maze: whatever was sealed is gone
   applyWallList(doc["sealed_walls"].as<JsonVariantConst>(), 1, "sealed");
+  setGhostFrom(doc["ghost"], size);
   memcpy(gCur, nextCur, sizeof(gCur));
   memcpy(gGoal, nextGoal, sizeof(gGoal));
   gNonce = doc["movenonce"] | (int64_t)0;
@@ -3714,15 +3946,20 @@ static void handleMazeState(JsonDocument& doc) {
   }
   memcpy(gCur, nextCur, sizeof(gCur));
   memcpy(gGoal, nextGoal, sizeof(gGoal));
+  setGhostFrom(st["ghost"], size);
   gNonce = st["movenonce"] | (int64_t)0;
   gGrowth = st["growthcount"] | (int64_t)0;
   gHasMaze = true;
   gPhase = PH_MINE;
   gAwait = AWAIT_NONE;
   gAwaitFails = 0;
-  gNoPathCount = 0;
+  // Do NOT reset gNoPathCount here: this maze_state is the SAME maze the
+  // resync asked about, so a no-path verdict survives the round trip
+  // (resetting it let the "no path (limit)" escape never fire). And do
+  // not clobber a pending no-path backoff in gNextMoveMs: resuming
+  // immediately after every resync is what spun the 2-7 ms loop.
   gHasPrev = false;
-  gNextMoveMs = millis();
+  if ((int32_t)(gNextMoveMs - millis()) < 0) gNextMoveMs = millis();
   logf_("SYNC", "resynced pos=(%d,%d,%d) goal=(%d,%d,%d) nonce=%lld growth=%lld",
         gCur[0], gCur[1], gCur[2], gGoal[0], gGoal[1], gGoal[2],
         (long long)gNonce, (long long)gGrowth);
@@ -3732,6 +3969,7 @@ static void handleMoveAck(JsonDocument& doc) {
   // The node echoes authoritative counters on both success and rejection.
   if (!doc["movenonce"].isNull()) gNonce = doc["movenonce"].as<int64_t>();
   if (!doc["growthcount"].isNull()) gGrowth = doc["growthcount"].as<int64_t>();
+  setGhostFrom(doc["ghost"], gDim);
   gAwait = AWAIT_NONE;
   gAwaitFails = 0;
 
@@ -3768,7 +4006,9 @@ static void handleMoveAck(JsonDocument& doc) {
       memcpy(gGoal, nextGoal, sizeof(gGoal));
       if (!doc["movenonce"].isNull()) gNonce = doc["movenonce"].as<int64_t>();
       if (!doc["growthcount"].isNull()) gGrowth = doc["growthcount"].as<int64_t>();
+      clearSealedSet();  // new maze: whatever was sealed is gone
       applyWallList(doc["sealed_walls"].as<JsonVariantConst>(), 1, "sealed");
+      setGhostFrom(doc["ghost"], size);  // re-read against the NEW maze dim
 
       // Learn from the previous maze using a terminal transition: never
       // bootstrap Q-values from the newly spawned maze. A goal capture is
@@ -3813,7 +4053,7 @@ static void handleMoveAck(JsonDocument& doc) {
     // The top-level list is the authoritative sealed-wall set for this maze;
     // state-level lists are per-move deltas. Apply them before computing the
     // next-state features used by the learner.
-    applyWallList(doc["sealed_walls"].as<JsonVariantConst>(), 1, "sealed");
+    applySealedSetFull(doc["sealed_walls"].as<JsonVariantConst>());
     if (!st.isNull()) {
       applyWallList(st["sealed_walls"].as<JsonVariantConst>(), 1, "sealed");
       applyWallList(st["opened_walls"].as<JsonVariantConst>(), 0, "opened");
@@ -3878,13 +4118,13 @@ static void handleMoveAck(JsonDocument& doc) {
         if (expected > 0) gNonce = expected - 1;
       }
       logf_("MOVE", "nonce resync -> %lld", (long long)gNonce);
-      applyWallList(doc["sealed_walls"].as<JsonVariantConst>(), 1, "sealed");
+      applySealedSetFull(doc["sealed_walls"].as<JsonVariantConst>());
       int open[6];
       computeOpen(open);
       aiLearn(AI_R_REJECT, false, open);
       gNextMoveMs = millis();
     } else {
-      applyWallList(doc["sealed_walls"].as<JsonVariantConst>(), 1, "sealed");
+      applySealedSetFull(doc["sealed_walls"].as<JsonVariantConst>());
       int open[6];
       computeOpen(open);
       aiLearn(AI_R_REJECT, false, open);
@@ -3899,8 +4139,13 @@ static void handleWallHit(JsonDocument& doc) {
   // reply to our move: a wall PoW challenge is pending server-side.
   gAwait = AWAIT_NONE;
   gAwaitFails = 0;
-  if (!doc["movenonce"].isNull()) gNonce = doc["movenonce"].as<int64_t>();
+  // Do NOT adopt movenonce here: the wall-hit reply carries the ATTEMPTED
+  // nonce (node.py R27 comment), not the un-incremented row nonce, so
+  // adopting it puts this miner one ahead (the PC miner explicitly skips
+  // it for the same reason). gNonce stays at the last accepted move nonce;
+  // the authoritative nonce arrives with wall_hit_solved / the next state.
   if (!doc["growthcount"].isNull()) gGrowth = doc["growthcount"].as<int64_t>();
+  setGhostFrom(doc["ghost"], doc["size"] | gDim);
 
   const char* seed = doc["seed"] | (const char*)"";
   int diff = doc["difficulty"] | 5;
@@ -3959,6 +4204,7 @@ static void handleWallSolved(JsonDocument& doc) {
   JsonArrayConst go = doc["goal"].as<JsonArrayConst>();
   int size = doc["size"] | 0;
   if (!arr.isNull() && adoptMazeArr(arr, size)) {
+    applySealedSetFull(doc["sealed_walls"].as<JsonVariantConst>());
     int8_t nextCur[3], nextGoal[3];
     if (!readMazeCoord(pos, size, nextCur) || !readMazeCoord(go, size, nextGoal)) {
       logf_("POW", "wall_hit_solved has invalid position/goal coordinates");
@@ -3967,6 +4213,7 @@ static void handleWallSolved(JsonDocument& doc) {
     }
     memcpy(gCur, nextCur, sizeof(gCur));
     memcpy(gGoal, nextGoal, sizeof(gGoal));
+    setGhostFrom(doc["ghost"], size);
     gHasMaze = true;
     if (gPhase != PH_MINE) gPhase = PH_MINE;
     gHasPrev = false;
@@ -3980,6 +4227,191 @@ static void handleWallSolved(JsonDocument& doc) {
   } else {
     requestResync("after wall solve");
   }
+}
+
+// ======= STREAMING MAZE PARSER (fix 1) =======
+// Why: JsonDocument::_parse() mallocs len*24+32768 for the generic arena.
+// A maze is dim^3 JSON booleans, so a dim-16 maze_init is ~25 KiB of JSON
+// but needs a ~638 KiB arena — more than the ESP32's whole SRAM — and the
+// miner then drops the maze and never mines again once the maze grows past
+// ~dim 8-10. The maze is the only huge field in these messages, so parse
+// just that array with a dedicated streaming parser that writes 1 byte per
+// cell straight into a malloc'd buffer (dim 16 = 4 KiB, dim 24 = 13.5 KiB),
+// then parse the REST of the message (with the maze array redacted to [])
+// through the normal generic parser. Maze data, algorithm and signing are
+// untouched; only the parsing path changes.
+struct MazeStream {
+  const char* p;
+  const char* end;
+  uint8_t* buf;
+  size_t len;
+  size_t cap;
+  bool fail;
+  bool tooBig;
+  int layerCounts[24];
+  int nLayers;
+  int rowCounts[24 * 24];
+  int nRows;
+};
+
+static void msSkipWs(MazeStream* m) {
+  while (m->p < m->end && (*m->p == ' ' || *m->p == '\t' || *m->p == '\n' || *m->p == '\r')) m->p++;
+}
+
+static bool msAppendCell(MazeStream* m, uint8_t cellBit) {
+  if (m->len >= (size_t)MAX_MAZE_DIM * MAX_MAZE_DIM * MAX_MAZE_DIM) {
+    m->tooBig = true;
+    m->fail = true;
+    return false;
+  }
+  if (m->len == m->cap) {
+    size_t ncap = m->cap ? m->cap * 2 : 1024;
+    uint8_t* nb = (uint8_t*)realloc(m->buf, ncap);
+    if (!nb) { m->fail = true; return false; }
+    m->buf = nb;
+    m->cap = ncap;
+  }
+  m->buf[m->len++] = cellBit;
+  return true;
+}
+
+static int msParseArray(MazeStream* m, int depth);
+
+static int msParseArray(MazeStream* m, int depth) {
+  msSkipWs(m);
+  if (m->fail || m->p >= m->end || *m->p != '[') { m->fail = true; return 0; }
+  m->p++;
+  msSkipWs(m);
+  if (m->p < m->end && *m->p == ']') { m->p++; return 0; }
+  int count = 0;
+  for (;;) {
+    if (depth >= 3) {
+      // Leaf cell: JSON boolean (node) or integer 0/1 (older variants).
+      // Anything else (string/float/null/other int) is rejected, same as
+      // readMazeCellBit() in the generic path.
+      uint8_t cellBit = 0;
+      if ((size_t)(m->end - m->p) >= 4 && memcmp(m->p, "true", 4) == 0) {
+        cellBit = 1;
+        m->p += 4;
+      } else if ((size_t)(m->end - m->p) >= 5 && memcmp(m->p, "false", 5) == 0) {
+        cellBit = 0;
+        m->p += 5;
+      } else if (m->p < m->end && (*m->p == '0' || *m->p == '1')) {
+        cellBit = (uint8_t)(*m->p - '0');
+        m->p++;
+      } else {
+        m->fail = true;
+        return 0;
+      }
+      if (!msAppendCell(m, cellBit)) return 0;
+    } else {
+      int child = msParseArray(m, depth + 1);
+      if (m->fail) return 0;
+      if (depth == 1) {
+        if (m->nLayers >= MAX_MAZE_DIM) { m->tooBig = true; m->fail = true; return 0; }
+        m->layerCounts[m->nLayers++] = child;
+      } else if (depth == 2) {
+        if (m->nRows >= MAX_MAZE_DIM * MAX_MAZE_DIM) { m->tooBig = true; m->fail = true; return 0; }
+        m->rowCounts[m->nRows++] = child;
+      }
+    }
+    count++;
+    if (count > MAX_MAZE_DIM) { m->tooBig = true; m->fail = true; return 0; }
+    msSkipWs(m);
+    if (m->p < m->end && *m->p == ',') { m->p++; continue; }
+    if (m->p < m->end && *m->p == ']') { m->p++; break; }
+    m->fail = true;
+    return 0;
+  }
+  return count;
+}
+
+// Parse the maze array span [s, s+n) into a fresh malloc'd cell buffer.
+// Returns true on success (*outCells owned by the caller, *outDim = cube
+// dim). On structural overflow past MAX_MAZE_DIM sets *outTooBig (the
+// caller still redacts + parses the rest so the size field reaches the
+// oversize wait path in the handlers).
+static bool streamParseMaze(const char* s, size_t n, uint8_t** outCells,
+                            int* outDim, bool* outTooBig) {
+  if (!s || n == 0 || !outCells || !outDim || !outTooBig) return false;
+  *outCells = NULL;
+  *outDim = 0;
+  *outTooBig = false;
+  MazeStream m;
+  memset(&m, 0, sizeof(m));
+  m.p = s;
+  m.end = s + n;
+  int dim = msParseArray(&m, 1);
+  msSkipWs(&m);
+  if (m.fail || m.p != m.end || dim <= 0 || dim > MAX_MAZE_DIM) {
+    if (m.buf) free(m.buf);
+    *outTooBig = m.tooBig;
+    return false;
+  }
+  // Cubic shape: every layer has dim rows, every row has dim cells.
+  if (m.nLayers != dim || m.nRows != dim * dim ||
+      m.len != (size_t)dim * dim * dim) {
+    free(m.buf);
+    return false;
+  }
+  for (int i = 0; i < m.nLayers; i++)
+    if (m.layerCounts[i] != dim) { free(m.buf); return false; }
+  for (int i = 0; i < m.nRows; i++)
+    if (m.rowCounts[i] != dim) { free(m.buf); return false; }
+  *outCells = m.buf;
+  *outDim = dim;
+  return true;
+}
+
+// Find the "maze" key's array span in a JSON message. String-aware: only a
+// real object key matches, never the word inside a string value. Returns
+// true with [start,end) = the array including brackets.
+static bool findMazeSpan(const char* payload, size_t len,
+                         size_t* outStart, size_t* outEnd) {
+  size_t i = 0;
+  while (i < len) {
+    if (payload[i] != '"') { i++; continue; }
+    size_t j = i + 1;
+    bool closed = false;
+    while (j < len) {
+      char c = payload[j];
+      if (c == '\\') { j += 2; continue; }
+      if (c == '"') { closed = true; break; }
+      j++;
+    }
+    if (!closed) return false;
+    size_t klen = j - (i + 1);
+    bool isMazeKey = (klen == 4 && memcmp(payload + i + 1, "maze", 4) == 0);
+    i = j + 1;
+    if (!isMazeKey) continue;
+    size_t k = i;
+    while (k < len && (payload[k] == ' ' || payload[k] == '\t' ||
+                       payload[k] == '\n' || payload[k] == '\r')) k++;
+    if (k >= len || payload[k] != ':') continue;
+    k++;
+    while (k < len && (payload[k] == ' ' || payload[k] == '\t' ||
+                       payload[k] == '\n' || payload[k] == '\r')) k++;
+    if (k >= len || payload[k] != '[') continue;
+    int depth = 0;
+    bool inStr = false;
+    size_t e = k;
+    for (; e < len; e++) {
+      char c = payload[e];
+      if (inStr) {
+        if (c == '\\') { e++; continue; }
+        if (c == '"') inStr = false;
+        continue;
+      }
+      if (c == '"') { inStr = true; continue; }
+      if (c == '[') depth++;
+      else if (c == ']') { depth--; if (depth == 0) { e++; break; } }
+    }
+    if (depth != 0) return false;
+    *outStart = k;
+    *outEnd = e;
+    return true;
+  }
+  return false;
 }
 
 static void handleMessage(const char* payload, size_t len) {
@@ -4014,9 +4446,52 @@ static void handleMessage(const char* payload, size_t len) {
     }
   }
 
+  // Streaming maze path (fix 1): if this message carries a "maze" array,
+  // parse that array straight into a 1-byte-per-cell buffer and redact it
+  // to [] before the generic parse, so the generic arena only ever sees
+  // the small remainder. Falls back to the plain generic parse when the
+  // message has no maze array or the maze is malformed; an oversize maze
+  // (dim > MAX_MAZE_DIM) still redacts so the size field reaches the
+  // oversize wait path in the handlers.
   JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, payload, len);
+  DeserializationError err;
+  char* redacted = NULL;
+  size_t mazeStart = 0, mazeEnd = 0;
+  if (findMazeSpan(payload, len, &mazeStart, &mazeEnd)) {
+    uint8_t* cells = NULL;
+    int dim = 0;
+    bool tooBig = false;
+    bool streamOk = streamParseMaze(payload + mazeStart, mazeEnd - mazeStart,
+                                    &cells, &dim, &tooBig);
+    if (streamOk || tooBig) {
+      if (streamOk) {
+        clearStreamedMaze();
+        gStreamCells = cells;
+        gStreamDim = dim;
+        gStreamValid = true;
+      }
+      redacted = (char*)malloc(len + 1);
+      if (redacted) {
+        memcpy(redacted, payload, mazeStart);
+        memcpy(redacted + mazeStart, "[]", 2);
+        size_t tail = len - mazeEnd;
+        memcpy(redacted + mazeStart + 2, payload + mazeEnd, tail);
+        size_t redactedLen = mazeStart + 2 + tail;
+        redacted[redactedLen] = 0;
+        err = deserializeJson(doc, redacted, redactedLen);
+      } else {
+        clearStreamedMaze();
+        err = deserializeJson(doc, payload, len);
+      }
+    } else {
+      err = deserializeJson(doc, payload, len);
+    }
+  } else {
+    err = deserializeJson(doc, payload, len);
+  }
+  if (redacted) free(redacted);
   if (err) {
+    clearStreamedMaze();
     logf_("RX", "JSON error: %s (len=%u); check the installed WebSockets library frame limit",
           err.c_str(), (unsigned)len);
     return;
@@ -4123,20 +4598,25 @@ static void handleMessage(const char* payload, size_t len) {
   } else {
     logf_("RX", "unhandled type '%s'", type);
   }
+  clearStreamedMaze();  // consumed by adoptMazeArr, or dropped if unused
 }
 
 static void onWsEvent(WStype_t type, uint8_t* payload, size_t len) {
   switch (type) {
     case WStype_CONNECTED: {
       gWsUp = true;
+      gConnectedSinceBegin = true;
       gConnectedMs = millis();
       gLastFrameMs = millis();
       gMazeAskDone = false;
       logf_("WS", "connected to %s:%d", gNodeHost, (int)gNodePort);
+      // No NTP gate on register: a slow or blocked NTP path used to loop
+      // connect/disconnect here for up to 180 s (and never register at all
+      // where UDP 123 is blocked). Register anyway; if the clock is
+      // actually off, the node answers registration_failed, which is
+      // already handled. NTP still runs in the background (ntpWatchdog).
       if (!gNtpOk && !gNtpDead) {
-        logf_("WS", "NTP not synced yet - refusing register, retrying");
-        doReconnect("ntp pending");
-        break;
+        logf_("WS", "NTP not synced yet - registering anyway (node rejects if clock is off)");
       }
       if (gNtpDead) logf_("WS", "WARNING: registering with unsynced clock (no NTP) - node may reject timestamp");
       sendRegister();
@@ -4147,6 +4627,7 @@ static void onWsEvent(WStype_t type, uint8_t* payload, size_t len) {
       gWsUp = false;
       gRegistered = false;
       gHasMaze = false;
+      gHasGhost = false;
       gAwait = AWAIT_NONE;
       gChalPending = false;
       if (gChalOuterInit) { mbedtls_sha256_free(&gChalOuter); gChalOuterInit = false; }
@@ -4296,6 +4777,36 @@ static void wsWatchdog(uint32_t now) {
             gNodeHost, (int)gNodePort,
             WiFi.localIP().toString().c_str(), gNtpOk ? "ok" : (gNtpDead ? "dead" : "wait"));
     }
+  }
+
+  // Re-pick: the current pick has never connected since begin() and the
+  // library has had a full minute to dial it — it is dead, refused, or a
+  // tunnel the plain-TCP client cannot reach. Try the next usable registry
+  // entry, then the configured node. Rate-limited to one re-pick per
+  // WS_REPICK_AFTER_MS, and never after falling back to the configured
+  // node (the library keeps redialling that one).
+  if (!gWsUp && gWsBegun && !gConnectedSinceBegin && !gOnConfigFallback &&
+      (now - gWsBeginMs) > WS_REPICK_AFTER_MS &&
+      (now - gLastRepickMs) > WS_REPICK_AFTER_MS) {
+    gLastRepickMs = now;
+    bool picked = false;
+    if (!gRegistryExhausted) {
+      uint8_t next = (uint8_t)(gRegistryIdx + 1);
+      if (fetchRegistryNodeIdx(next)) {
+        gRegistryIdx = next;
+        picked = true;
+      } else {
+        gRegistryExhausted = true;
+      }
+    }
+    if (!picked) {
+      pickConfiguredNode();
+      gOnConfigFallback = true;
+      logf_("WS", "no more registry nodes, falling back to configured node %s:%d",
+            gNodeHost, (int)gNodePort);
+    }
+    webSocket.disconnect();
+    wsBeginCurrent();
   }
 
   // awaiting-reply timeouts
@@ -4472,22 +4983,54 @@ static void miningTick(uint32_t now) {
 
   if ((int32_t)(now - gNextMoveMs) < 0) return;
 
+  clearBfsModes();  // a stale fallback flag must never leak into this tick
   int nextCell[3];
   int rc = bfsFirstStep(gCur, gGoal, nextCell);
+  int bfsMode = 0;  // 0 normal, 1 ignore ghost, 2 ignore sealed, 3 ignore both
+  if (rc < 0 && gHasGhost) {
+    gBfsIgnoreGhost = true;
+    rc = bfsFirstStep(gCur, gGoal, nextCell);
+    if (rc >= 0) bfsMode = 1;
+    else gBfsIgnoreGhost = false;
+  }
   if (rc < 0) {
-    // no path (growth/seal divergence): resync, limited retries
+    gBfsIgnoreSealed = true;
+    rc = bfsFirstStep(gCur, gGoal, nextCell);
+    if (rc >= 0) bfsMode = 2;
+    else {
+      gBfsIgnoreGhost = true;
+      rc = bfsFirstStep(gCur, gGoal, nextCell);
+      if (rc >= 0) bfsMode = 3;
+      else clearBfsModes();
+    }
+  }
+  if (rc < 0) {
+    // No path even ignoring the ghost and reported-sealed cells: the
+    // node's own maze is disconnected for this miner (run-1 root cause:
+    // the node sealed the only bridge after checking the path on the
+    // mutated maze, not the base maze). Do NOT reconnect-spin — a new
+    // connection gets the same maze. Stay registered (the lottery is
+    // size-based, blocks still come) and slow-poll state so a maze
+    // change (e.g. a node restart clears the in-memory sealed set)
+    // resumes mining immediately.
     gNoPathCount++;
     if (gNoPathCount > NO_PATH_RESYNC_LIMIT) {
-      gNoPathCount = 0;
-      doReconnect("no path (limit)");
+      logf_("MOVE", "no path (count=%d) even ignoring sealed cells - slow-polling state, staying registered", gNoPathCount);
+      gNextMoveMs = now + NO_PATH_SLOW_POLL_MS;
+      requestResync("no path (slow poll)");
     } else {
       requestResync("no path");
+      gNextMoveMs = now + 3000;
     }
-    gNextMoveMs = now + 3000;
     return;
+  }
+  gNoPathCount = 0;
+  if (bfsMode > 0) {
+    logf_("MOVE", "fallback BFS mode=%d (1=ignore ghost, 2=ignore sealed, 3=both)", bfsMode);
   }
   if (rc == 0) {
     // local view says cur == goal — server state must advance us
+    clearBfsModes();
     requestResync("cur == goal");
     gNextMoveMs = now + 2000;
     return;
@@ -4499,18 +5042,19 @@ static void miningTick(uint32_t now) {
   int dz = nextCell[2] - gCur[2];
   for (int d = 0; d < 6; d++)
     if (kDirDx[d] == dx && kDirDy[d] == dy && kDirDz[d] == dz) { bfsDir = d; break; }
-  if (bfsDir < 0) { gNextMoveMs = now + 1000; return; }
+  if (bfsDir < 0) { clearBfsModes(); gNextMoveMs = now + 1000; return; }
 
   int open[6];
   computeOpen(open);
   int dir = aiChoose(bfsDir, open);
-  if (dir < 0) { gNextMoveMs = now + 500; return; }
+  if (dir < 0) { clearBfsModes(); gNextMoveMs = now + 500; return; }
 
   const int targetX = gCur[0] + kDirDx[dir];
   const int targetY = gCur[1] + kDirDy[dir];
   const int targetZ = gCur[2] + kDirDz[dir];
   if (!inBounds(targetX, targetY, targetZ) || !isOpen(targetX, targetY, targetZ)) {
     gHasPrev = false;
+    clearBfsModes();
     requestResync("planner selected invalid local step");
     gNextMoveMs = millis() + 1000;
     return;
@@ -4524,6 +5068,7 @@ static void miningTick(uint32_t now) {
 
   if (!sendMove(dir)) {
     gHasPrev = false;
+    clearBfsModes();
     gNextMoveMs = now + 1000;
     return;
   }
@@ -4533,6 +5078,7 @@ static void miningTick(uint32_t now) {
         kDirName[dir], gCur[0], gCur[1], gCur[2],
         targetX, targetY, targetZ, gDim, kDirName[bfsDir],
         (double)gEps, (int)gLlmPref);
+  clearBfsModes();
 }
 // ======= LOOP =======
 static void identitySelfPrint() {
@@ -4542,10 +5088,34 @@ static void identitySelfPrint() {
         (unsigned)ESP.getFreePsram());
 }
 
+// Reset-reason name for the boot diagnostic (fix 8): tells a power
+// brownout (POWERON_RESET / BROWNOUT) apart from a watchdog panic or a
+// software restart on real hardware.
+static const char* resetReasonName(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_UNKNOWN: return "UNKNOWN";
+    case ESP_RST_POWERON: return "POWERON_RESET";
+    case ESP_RST_EXT: return "EXT_RESET";
+    case ESP_RST_SW: return "SW_CPU_RESET";
+    case ESP_RST_PANIC: return "PANIC";
+    case ESP_RST_INT_WDT: return "INT_WDT";
+    case ESP_RST_TASK_WDT: return "TASK_WDT";
+    case ESP_RST_WDT: return "WDT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT: return "BROWNOUT";
+    case ESP_RST_SDIO: return "SDIO";
+    default: return "OTHER";
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println();
+  // Diagnostic only, no behaviour change: log how this boot was reset so a
+  // reboot on real hardware can be diagnosed (power brownout vs watchdog
+  // panic vs software restart).
+  logf_("BOOT", "reset reason: %s", resetReasonName(esp_reset_reason()));
   identitySelfPrint();
   if (!WIFI_SSID[0] || !WIFI_PASSWORD[0] ||
       strcmp(WIFI_SSID, "CHANGE_ME_WIFI_SSID") == 0 ||
@@ -4589,7 +5159,8 @@ void setup() {
   // (silence/register/maze/await timeouts) via doReconnect()->disconnect().
   webSocket.setReconnectInterval(WS_RECONNECT_MIN_MS);
   // initial begin happens once in wsEnsureBegun as soon as WiFi is up
-  // (NTP gates REGISTER only, never the TCP client itself)
+  // (NTP gates nothing: registration proceeds without sync and the node
+  // rejects a wrong clock with registration_failed)
 
   logf_("BOOT", "setup complete");
 }

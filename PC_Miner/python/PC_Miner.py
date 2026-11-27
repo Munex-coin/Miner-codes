@@ -2409,6 +2409,18 @@ class PCMiner:
             log(f"No node URL to connect to", "error", "net0")
             return False
         try:
+            # R40-1: a previous socket may still be open (a failed
+            # registration left it behind). Close it before opening
+            # a new one, or the node keeps the old socket in
+            # miner_websockets[miner_id] and rejects the re-register
+            # as a duplicate. Bounded so a hung close cannot stall
+            # the reconnect; close() sends the frame first.
+            if self.ws is not None:
+                try:
+                    await asyncio.wait_for(self.ws.close(), timeout=5)
+                except Exception:
+                    pass
+                self.ws = None
             start = time.time()
             self.ws = await websockets.connect(url, ping_interval=20, ping_timeout=60,
                                                 open_timeout=30, close_timeout=20, max_size=2**24)
@@ -2566,7 +2578,12 @@ class PCMiner:
                 "type": "memory_challenge_response", "miner_id": self.miner_id,
                 "seed": data["seed"], "commitment": base64.b64encode(commitment).decode()
             }))
-            deadline_loop = time.time() + 60
+            # R40-2: the node generates the maze after "registered"; a
+            # cold grown maze takes ~174 s at size 22 (R30) and >51 s
+            # was seen live for size 15 on a contended node. 60 s is
+            # too short - the miner times out while the node is still
+            # generating. Wait long enough for a cold grown maze.
+            deadline_loop = time.time() + 240
             while time.time() < deadline_loop:
                 try:
                     raw = await asyncio.wait_for(self.ws.recv(), timeout=deadline_loop - time.time())
@@ -4488,6 +4505,12 @@ class PCMiner:
                         log("Old connection closed but recovery active, keeping new connection", "info", "net0")
             else:
                 log("Registration failed, retrying...", "warning", "net0")
+                # R40-3: the failed registration's socket is still open
+                # on the node (miner_websockets[miner_id] holds it).
+                # Close it before retrying, or the re-register is
+                # rejected as "already connected" from another device
+                # - the old socket is this miner's own abandoned one.
+                await self.disconnect()
                 # TUNNEL-PARITY-1: a node that accepts TCP but never
                 # registers used to pin the miner forever (no attempt
                 # counting here). Count it like a connect failure and,
